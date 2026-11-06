@@ -36,6 +36,10 @@ func main() {
 const usage = `usage:
   acphost run  -c FILE [flags] -- CMD ARGS...
   acphost host -c FILE --dir SESSIONDIR [--lease 30m] [flags] -- CMD ARGS...
+  acphost start -c FILE --dir STATEDIR [--grace 10s] [flags] -- CMD ARGS...
+  acphost status --dir STATEDIR
+  acphost stop --dir STATEDIR [--grace 30s]
+  acphost wait --dir STATEDIR
 `
 
 // multi collects a repeated flag.
@@ -47,7 +51,7 @@ func (m *multi) Set(s string) error { *m = append(*m, s); return nil }
 type opts struct {
 	mode                  string
 	config, dir, network  string
-	lease                 time.Duration
+	lease, grace          time.Duration
 	ro, rw, join          multi
 	print, check, verbose bool
 	argv                  []string
@@ -65,6 +69,7 @@ func parse(args []string, stderr io.Writer) (opts, error) {
 	fs.StringVar(&o.dir, "dir", "", "working dir (run) or session dir (host)")
 	fs.StringVar(&o.network, "network", "", "override sandbox network: host, none, pasta")
 	fs.DurationVar(&o.lease, "lease", 30*time.Minute, "host: exit after no controller for this long")
+	fs.DurationVar(&o.grace, "grace", 10*time.Second, "start: SIGTERM to SIGKILL delay on stop")
 	fs.Var(&o.ro, "ro", "add a read-only bind SRC[:DST] (repeatable)")
 	fs.Var(&o.rw, "rw", "add a read-write bind SRC[:DST] (repeatable)")
 	fs.Var(&o.join, "join", "join a namespace TYPE=PATH (repeatable)")
@@ -141,6 +146,9 @@ func build(o opts, stdin io.Reader) (acphost.Spec, error) {
 }
 
 func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
+	if len(args) > 0 && isDetached(args[0]) {
+		return detached(args, stdin, stdout, stderr)
+	}
 	o, err := parse(args, stderr)
 	if err != nil {
 		if !errors.Is(err, flag.ErrHelp) {
@@ -185,14 +193,7 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 		say(stderr, "acphost:", err)
 		return 125
 	}
-	if ex.SetupError != "" {
-		say(stderr, "acphost: setup failed:", ex.SetupError)
-		return 125
-	}
-	if ex.Signal != "" {
-		return 128 + signalNumber(ex.Signal)
-	}
-	return ex.ExitCode
+	return exitCode(ex, stderr)
 }
 
 func procSpec(s acphost.Spec) proc.Spec {
