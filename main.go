@@ -22,8 +22,10 @@ import (
 	"time"
 
 	"github.com/elee1766/acphost/pkg/acphost"
+	"github.com/elee1766/acphost/pkg/cgroup"
 	"github.com/elee1766/acphost/pkg/proc"
 	"github.com/elee1766/acphost/pkg/sandbox"
+	"github.com/elee1766/acphost/pkg/userns"
 )
 
 func main() {
@@ -247,12 +249,12 @@ func printPlan(s acphost.Spec, stdout, stderr io.Writer) int {
 	plan := struct {
 		Argv   []string             `json:"argv"`
 		Join   []string             `json:"join,omitempty"`
-		User   *acphost.User        `json:"user,omitempty"`
+		User   *userns.User         `json:"user,omitempty"`
 		Maps   *acphost.UserApplied `json:"user_maps,omitempty"`
-		Cgroup *acphost.Cgroup      `json:"cgroup,omitempty"`
+		Cgroup *cgroup.Cgroup       `json:"cgroup,omitempty"`
 	}{Argv: append([]string{s.Command}, s.Args...), Join: acphost.JoinPlan(s), User: s.User, Cgroup: s.Cgroup}
 	if s.Sandbox != nil {
-		argv, err := acphost.SandboxArgs(*s.Sandbox, s.Command, s.Args, s.Dir)
+		argv, err := sandbox.Args(*s.Sandbox, s.Command, s.Args, s.Dir)
 		if err != nil {
 			say(stderr, "acphost:", err)
 			return 1
