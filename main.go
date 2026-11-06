@@ -3,10 +3,14 @@
 //
 //	acphost run  -c sandbox.yaml [flags] -- CMD ARGS...
 //	acphost host -c sandbox.yaml --dir SESSIONDIR [--lease 30m] -- CMD ARGS...
+//	acphost start [--host] -c sandbox.yaml --dir DIR -- CMD ARGS...
+//	acphost status|stop|wait --dir DIR
 //
 // run executes one command attached to the terminal and exits with its
 // status. host writes spec.json into SESSIONDIR and runs the ACP host
-// (acphost.Main) in the foreground. See docs/notes/165-cli.md.
+// (acphost.Main) in the foreground. start runs a command, or with --host
+// an ACP host, detached; status, stop and wait use its dir. See
+// docs/notes/165-cli.md, 200-cli-detached.md and 211-cli-host-detached.md.
 package main
 
 import (
@@ -29,7 +33,7 @@ import (
 )
 
 func main() {
-	proc.MaybeChild()
+	acphost.MaybeChild()
 	os.Exit(run(os.Args[1:], os.Stdin, os.Stdout, os.Stderr))
 }
 
@@ -37,6 +41,7 @@ const usage = `usage:
   acphost run  -c FILE [flags] -- CMD ARGS...
   acphost host -c FILE --dir SESSIONDIR [--lease 30m] [flags] -- CMD ARGS...
   acphost start -c FILE --dir STATEDIR [--grace 10s] [flags] -- CMD ARGS...
+  acphost start --host -c FILE --dir SESSIONDIR [--lease 30m] [flags] -- CMD ARGS...
   acphost status --dir STATEDIR
   acphost stop --dir STATEDIR [--grace 30s]
   acphost wait --dir STATEDIR
@@ -54,6 +59,7 @@ type opts struct {
 	lease, grace          time.Duration
 	ro, rw, join          multi
 	print, check, verbose bool
+	detachHost            bool // start --host: run an ACP host detached
 	argv                  []string
 }
 
@@ -76,6 +82,7 @@ func parse(args []string, stderr io.Writer) (opts, error) {
 	fs.BoolVar(&o.print, "print", false, "print the argv and isolation record, run nothing")
 	fs.BoolVar(&o.check, "check", false, "run the pre-spawn checks only")
 	fs.BoolVar(&o.verbose, "v", false, "print the isolation record to stderr after the run")
+	fs.BoolVar(&o.detachHost, "host", false, "start: run an ACP host detached (--dir is the session dir)")
 	if err := fs.Parse(args[1:]); err != nil {
 		return o, err
 	}
@@ -157,6 +164,10 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 		if errors.Is(err, errUsage) {
 			sayf(stderr, "%s", usage)
 		}
+		return 2
+	}
+	if o.detachHost {
+		say(stderr, "acphost: --host is only for start (host already runs a host)")
 		return 2
 	}
 	s, err := build(o, stdin)

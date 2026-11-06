@@ -8,13 +8,13 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/elee1766/acphost/pkg/proc"
+	"github.com/elee1766/acphost/pkg/acphost"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
 func TestMain(m *testing.M) {
-	proc.MaybeChild()
+	acphost.MaybeChild()
 	os.Exit(m.Run())
 }
 

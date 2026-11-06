@@ -9,13 +9,15 @@ import (
 	"os"
 	"time"
 
+	"github.com/elee1766/acphost/pkg/acphost"
 	"github.com/elee1766/acphost/pkg/proc"
 	"golang.org/x/sys/unix"
 )
 
-// Detached mode (#200): start, status, stop and wait on a command run by
-// proc.StartDetached, with its state in --dir. See
-// docs/notes/200-cli-detached.md.
+// Detached mode (#200, #211): start, status, stop and wait on a command
+// run by proc.StartDetached, or with start --host an ACP host run by
+// acphost.StartDetached, with its state in --dir. See
+// docs/notes/200-cli-detached.md and docs/notes/211-cli-host-detached.md.
 
 // isDetached reports whether cmd is one of the detached subcommands.
 func isDetached(cmd string) bool {
@@ -78,6 +80,9 @@ func start(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 		return 2
 	}
 	dir := o.dir
+	if o.detachHost {
+		return startHost(o, stdin, stdout, stderr)
+	}
 	o.dir = ""
 	s, err := build(o, stdin)
 	if err != nil {
@@ -95,6 +100,43 @@ func start(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 		say(stderr, "acphost:", err)
 		return 125
 	}
+	say(stdout, d.Pid)
+	return 0
+}
+
+// startHost is start --host: write spec.json into --dir as host does,
+// then run the host detached. The agent runs in the cwd.
+func startHost(o opts, stdin io.Reader, stdout, stderr io.Writer) int {
+	o.mode = "host" // build names the session after --dir and runs the agent in the cwd
+	s, err := build(o, stdin)
+	if err != nil {
+		say(stderr, "acphost:", err)
+		return 2
+	}
+	dir := o.dir
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		say(stderr, "acphost:", err)
+		return 1
+	}
+	if acphost.Alive(dir) {
+		// Checked before WriteSpec, which would replace a running host's spec.
+		say(stderr, "acphost: a host already running in", dir)
+		return 125
+	}
+	if err := acphost.CheckSpawn(s, false, acphost.WithHostDir(dir)); err != nil {
+		say(stderr, "acphost:", err)
+		return 125
+	}
+	if err := acphost.WriteSpec(dir, s); err != nil {
+		say(stderr, "acphost:", err)
+		return 1
+	}
+	d, err := acphost.StartDetached(dir, nil)
+	if err != nil {
+		say(stderr, "acphost:", err)
+		return 125
+	}
+	say(stderr, "acphost: socket", acphost.SocketPath(dir))
 	say(stdout, d.Pid)
 	return 0
 }
