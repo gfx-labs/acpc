@@ -8,6 +8,7 @@ import (
 	"os"
 	"strings"
 
+	"github.com/elee1766/acphost/pkg/acphost"
 	"github.com/elee1766/acphost/pkg/cgroup"
 	"github.com/elee1766/acphost/pkg/sandbox"
 	"github.com/elee1766/acphost/pkg/userns"
@@ -25,6 +26,10 @@ type Config struct {
 	Env []string `json:"env,omitempty"`
 	// Join maps a namespace type to a namespace file (Spec.Join).
 	Join map[string]string `json:"join,omitempty"`
+	// Listen and TLS are Spec.Listen and Spec.TLS: the optional TCP
+	// listener of a host.
+	Listen string             `json:"listen,omitempty"`
+	TLS    *acphost.ListenTLS `json:"tls,omitempty"`
 }
 
 // readConfig reads path ("-" is stdin, "" is an empty config).

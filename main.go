@@ -22,6 +22,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"time"
 
@@ -58,6 +59,10 @@ type opts struct {
 	config, dir, network  string
 	lease, grace          time.Duration
 	ro, rw, join          multi
+	listen                string
+	tlsCert, tlsKey       string
+	tlsClientCA           string
+	tlsAllow              multi
 	print, check, verbose bool
 	detachHost            bool // start --host: run an ACP host detached
 	argv                  []string
@@ -79,6 +84,11 @@ func parse(args []string, stderr io.Writer) (opts, error) {
 	fs.Var(&o.ro, "ro", "add a read-only bind SRC[:DST] (repeatable)")
 	fs.Var(&o.rw, "rw", "add a read-write bind SRC[:DST] (repeatable)")
 	fs.Var(&o.join, "join", "join a namespace TYPE=PATH (repeatable)")
+	fs.StringVar(&o.listen, "listen", "", "host: also listen on this TCP HOST:PORT (an explicit host; port 0 picks one)")
+	fs.StringVar(&o.tlsCert, "tls-cert", "", "host: server certificate (PEM) for the TCP listener")
+	fs.StringVar(&o.tlsKey, "tls-key", "", "host: server key (PEM) for the TCP listener")
+	fs.StringVar(&o.tlsClientCA, "tls-client-ca", "", "host: CA bundle (PEM) client certificates must chain to")
+	fs.Var(&o.tlsAllow, "tls-allow", "host: allow only clients with this DNS or URI SAN (repeatable)")
 	fs.BoolVar(&o.print, "print", false, "print the argv and isolation record, run nothing")
 	fs.BoolVar(&o.check, "check", false, "run the pre-spawn checks only")
 	fs.BoolVar(&o.verbose, "v", false, "print the isolation record to stderr after the run")
@@ -139,6 +149,30 @@ func build(o opts, stdin io.Reader) (acphost.Spec, error) {
 		Protocol: acphost.Protocol, Session: "cli", Command: o.argv[0], Args: o.argv[1:],
 		Env: c.Env, Dir: dir, LeaseMS: o.lease.Milliseconds(),
 		Sandbox: c.Sandbox, User: c.User, Cgroup: c.Cgroup, Join: c.Join,
+		Listen: c.Listen, TLS: c.TLS,
+	}
+	if o.listen != "" {
+		s.Listen = o.listen
+	}
+	if o.tlsCert != "" || o.tlsKey != "" || o.tlsClientCA != "" || len(o.tlsAllow) > 0 {
+		t := acphost.ListenTLS{}
+		if s.TLS != nil {
+			t = *s.TLS
+		}
+		if o.tlsCert != "" {
+			t.Cert = o.tlsCert
+		}
+		if o.tlsKey != "" {
+			t.Key = o.tlsKey
+		}
+		if o.tlsClientCA != "" {
+			t.ClientCA = o.tlsClientCA
+		}
+		t.Allow = append(slices.Clone(t.Allow), o.tlsAllow...)
+		s.TLS = &t
+	}
+	if o.mode != "host" && (s.Listen != "" || s.TLS != nil) {
+		return acphost.Spec{}, errors.New("listen and tls are for a host (host, or start --host)")
 	}
 	if o.mode == "host" {
 		s.Session = filepath.Base(dir)
@@ -299,7 +333,13 @@ func host(o opts, s acphost.Spec, stderr io.Writer) int {
 		return 1
 	}
 	say(stderr, "acphost: socket", filepath.Join(o.dir, acphost.ACPSocket))
-	if err := acphost.Main(o.dir); err != nil {
+	var mainOpts []acphost.Option
+	if s.Listen != "" {
+		// The bound address is known once the host listens; port 0 is
+		// only resolved then.
+		mainOpts = append(mainOpts, acphost.WithListening(func(l acphost.ListenInfo) { sayListen(stderr, l) }))
+	}
+	if err := acphost.Main(o.dir, mainOpts...); err != nil {
 		say(stderr, "acphost:", err)
 		return 1
 	}
@@ -309,6 +349,16 @@ func host(o opts, s acphost.Spec, stderr io.Writer) int {
 		}
 	}
 	return 0
+}
+
+// sayListen reports the TCP listener: its bound address and whether mutual
+// TLS is on.
+func sayListen(w io.Writer, l acphost.ListenInfo) {
+	if l.TLS {
+		say(w, "acphost: listening", l.Addr, "(mutual tls)")
+		return
+	}
+	say(w, "acphost: listening", l.Addr, "(no tls, no authentication)")
 }
 
 func writeJSON(w io.Writer, v any) {

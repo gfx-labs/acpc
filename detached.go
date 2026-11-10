@@ -137,6 +137,13 @@ func startHost(o opts, stdin io.Reader, stdout, stderr io.Writer) int {
 		return 125
 	}
 	say(stderr, "acphost: socket", acphost.SocketPath(dir))
+	if s.Listen != "" {
+		// The host wrote listen.json before the agent started, which is
+		// when StartDetached returned.
+		if l, ok := acphost.ReadListen(dir); ok {
+			sayListen(stderr, l)
+		}
+	}
 	say(stdout, d.Pid)
 	return 0
 }
