@@ -8,7 +8,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/elee1766/acphost/pkg/acphost"
+	"github.com/gfx-labs/acphost/pkg/acphost"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )

@@ -8,10 +8,10 @@ import (
 	"os"
 	"strings"
 
-	"github.com/elee1766/acphost/pkg/acphost"
-	"github.com/elee1766/acphost/pkg/cgroup"
-	"github.com/elee1766/acphost/pkg/sandbox"
-	"github.com/elee1766/acphost/pkg/userns"
+	"github.com/gfx-labs/acphost/pkg/acphost"
+	"github.com/gfx-labs/acphost/pkg/cgroup"
+	"github.com/gfx-labs/acphost/pkg/sandbox"
+	"github.com/gfx-labs/acphost/pkg/userns"
 	"go.yaml.in/yaml/v3"
 )
 

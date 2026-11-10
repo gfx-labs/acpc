@@ -9,8 +9,8 @@ import (
 	"os"
 	"time"
 
-	"github.com/elee1766/acphost/pkg/acphost"
-	"github.com/elee1766/acphost/pkg/proc"
+	"github.com/gfx-labs/acphost/pkg/acphost"
+	"github.com/gfx-labs/acphost/pkg/proc"
 	"golang.org/x/sys/unix"
 )
 

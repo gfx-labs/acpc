@@ -8,9 +8,9 @@ import (
 	"strconv"
 	"syscall"
 
-	"github.com/elee1766/acphost/pkg/acphost"
-	"github.com/elee1766/acphost/pkg/hostenv"
-	"github.com/elee1766/acphost/pkg/userns"
+	"github.com/gfx-labs/acphost/pkg/acphost"
+	"github.com/gfx-labs/acphost/pkg/hostenv"
+	"github.com/gfx-labs/acphost/pkg/userns"
 	"golang.org/x/sys/unix"
 )
 
