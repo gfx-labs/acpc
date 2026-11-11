@@ -2,6 +2,8 @@ package main
 
 import (
 	"bytes"
+	"context"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -11,11 +13,27 @@ import (
 	"github.com/gfx-labs/acphost/pkg/acphost"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"github.com/urfave/cli/v3"
 )
 
 func TestMain(m *testing.M) {
 	acphost.MaybeChild()
+	maybeFakeAgent()
 	os.Exit(m.Run())
+}
+
+// parse runs a run, host or start command line as far as its flags and
+// returns the opts the command would act on.
+func parse(args []string, stderr io.Writer) (opts, error) {
+	a := newApp(nil, io.Discard, stderr)
+	var o opts
+	for _, c := range a.root.Commands {
+		c.Action = func(_ context.Context, cmd *cli.Command) (err error) {
+			o, err = a.opts(cmd)
+			return err
+		}
+	}
+	return o, a.exec(args)
 }
 
 func TestParseConfig(t *testing.T) {

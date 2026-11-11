@@ -1,23 +1,30 @@
-// Command acphost runs acphost by hand, to debug and test sandboxing and
-// isolation without jobshop (#165).
+// Command acphost runs acphost by hand: one command or an ACP host under
+// its isolation (#165), and named agent sessions to prompt from a shell.
 //
 //	acphost run  -c sandbox.yaml [flags] -- CMD ARGS...
 //	acphost host -c sandbox.yaml --dir SESSIONDIR [--lease 30m] -- CMD ARGS...
 //	acphost start [--host] -c sandbox.yaml --dir DIR -- CMD ARGS...
-//	acphost status|stop|wait --dir DIR
+//	acphost status|stop|wait --dir DIR | -s NAME
+//
+//	acphost new    -s NAME [-c sandbox.yaml] -- CMD ARGS...
+//	acphost prompt -s NAME TEXT...
+//	acphost exec   [-c sandbox.yaml] TEXT -- CMD ARGS...
+//	acphost attach|cancel|rm -s NAME
+//	acphost ls
 //
 // run executes one command attached to the terminal and exits with its
 // status. host writes spec.json into SESSIONDIR and runs the ACP host
 // (acphost.Main) in the foreground. start runs a command, or with --host
-// an ACP host, detached; status, stop and wait use its dir. See
-// docs/notes/165-cli.md, 200-cli-detached.md and 211-cli-host-detached.md.
+// an ACP host, detached; status, stop and wait use its dir. new starts a
+// detached host for an ACP agent and keeps it under a name; prompt sends
+// it a turn. See docs/notes/165-cli.md, 200-cli-detached.md,
+// 211-cli-host-detached.md and 290-cli-sessions.md.
 package main
 
 import (
 	"context"
 	"encoding/json"
 	"errors"
-	"flag"
 	"fmt"
 	"io"
 	"os"
@@ -31,6 +38,7 @@ import (
 	"github.com/gfx-labs/acphost/pkg/proc"
 	"github.com/gfx-labs/acphost/pkg/sandbox"
 	"github.com/gfx-labs/acphost/pkg/userns"
+	"github.com/urfave/cli/v3"
 )
 
 func main() {
@@ -38,67 +46,90 @@ func main() {
 	os.Exit(run(os.Args[1:], os.Stdin, os.Stdout, os.Stderr))
 }
 
-const usage = `usage:
-  acphost run  -c FILE [flags] -- CMD ARGS...
-  acphost host -c FILE --dir SESSIONDIR [--lease 30m] [flags] -- CMD ARGS...
-  acphost start -c FILE --dir STATEDIR [--grace 10s] [flags] -- CMD ARGS...
-  acphost start --host -c FILE --dir SESSIONDIR [--lease 30m] [flags] -- CMD ARGS...
-  acphost status --dir STATEDIR
-  acphost stop --dir STATEDIR [--grace 30s]
-  acphost wait --dir STATEDIR
-`
+func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
+	return newApp(stdin, stdout, stderr).run(args)
+}
 
-// multi collects a repeated flag.
-type multi []string
+// isolation is the config file and the flags that override it.
+type isolation struct {
+	config, network string
+	ro, rw, join    []string
+}
 
-func (m *multi) String() string     { return strings.Join(*m, ",") }
-func (m *multi) Set(s string) error { *m = append(*m, s); return nil }
+func (i isolation) set() bool {
+	return i.config != "" || i.network != "" || len(i.ro) > 0 || len(i.rw) > 0 || len(i.join) > 0
+}
+
+func isolationFrom(cmd *cli.Command) isolation {
+	return isolation{
+		config: cmd.String("config"), network: cmd.String("network"),
+		ro: cmd.StringSlice("ro"), rw: cmd.StringSlice("rw"), join: cmd.StringSlice("join"),
+	}
+}
 
 type opts struct {
-	mode                  string
-	config, dir, network  string
+	isolation
+	mode                  string // run or host
+	dir                   string
 	lease, grace          time.Duration
-	ro, rw, join          multi
 	listen                string
 	tlsCert, tlsKey       string
 	tlsClientCA           string
-	tlsAllow              multi
+	tlsAllow              []string
 	print, check, verbose bool
 	detachHost            bool // start --host: run an ACP host detached
 	argv                  []string
 }
 
-func parse(args []string, stderr io.Writer) (opts, error) {
-	var o opts
-	if len(args) == 0 || (args[0] != "run" && args[0] != "host") {
-		return o, errUsage
+// load reads the config file and applies the flag overrides.
+func (i isolation) load(stdin io.Reader) (Config, error) {
+	c, err := readConfig(i.config, stdin)
+	if err != nil {
+		return c, err
 	}
-	o.mode = args[0]
-	fs := flag.NewFlagSet("acphost "+o.mode, flag.ContinueOnError)
-	fs.SetOutput(stderr)
-	fs.StringVar(&o.config, "c", "", "config file (YAML or JSON), - for stdin")
-	fs.StringVar(&o.dir, "dir", "", "working dir (run) or session dir (host)")
-	fs.StringVar(&o.network, "network", "", "override sandbox network: host, none, pasta")
-	fs.DurationVar(&o.lease, "lease", 30*time.Minute, "host: exit after no controller for this long")
-	fs.DurationVar(&o.grace, "grace", 10*time.Second, "start: SIGTERM to SIGKILL delay on stop")
-	fs.Var(&o.ro, "ro", "add a read-only bind SRC[:DST] (repeatable)")
-	fs.Var(&o.rw, "rw", "add a read-write bind SRC[:DST] (repeatable)")
-	fs.Var(&o.join, "join", "join a namespace TYPE=PATH (repeatable)")
-	fs.StringVar(&o.listen, "listen", "", "host: also listen on this TCP HOST:PORT (an explicit host; port 0 picks one)")
-	fs.StringVar(&o.tlsCert, "tls-cert", "", "host: server certificate (PEM) for the TCP listener")
-	fs.StringVar(&o.tlsKey, "tls-key", "", "host: server key (PEM) for the TCP listener")
-	fs.StringVar(&o.tlsClientCA, "tls-client-ca", "", "host: CA bundle (PEM) client certificates must chain to")
-	fs.Var(&o.tlsAllow, "tls-allow", "host: allow only clients with this DNS or URI SAN (repeatable)")
-	fs.BoolVar(&o.print, "print", false, "print the argv and isolation record, run nothing")
-	fs.BoolVar(&o.check, "check", false, "run the pre-spawn checks only")
-	fs.BoolVar(&o.verbose, "v", false, "print the isolation record to stderr after the run")
-	fs.BoolVar(&o.detachHost, "host", false, "start: run an ACP host detached (--dir is the session dir)")
-	if err := fs.Parse(args[1:]); err != nil {
-		return o, err
+	if i.network != "" || len(i.ro) > 0 || len(i.rw) > 0 {
+		if c.Sandbox == nil {
+			c.Sandbox = &sandbox.Sandbox{}
+		}
+		if i.network != "" {
+			c.Sandbox.Network = i.network
+		}
+		for _, m := range i.ro {
+			c.Sandbox.RO = append(c.Sandbox.RO, parseMount(m))
+		}
+		for _, m := range i.rw {
+			c.Sandbox.RW = append(c.Sandbox.RW, parseMount(m))
+		}
 	}
-	o.argv = fs.Args()
+	for _, j := range i.join {
+		t, p, ok := strings.Cut(j, "=")
+		if !ok {
+			return c, fmt.Errorf("--join %q: want TYPE=PATH", j)
+		}
+		if c.Join == nil {
+			c.Join = map[string]string{}
+		}
+		c.Join[t] = p
+	}
+	return c, nil
+}
+
+// opts reads the flags of run, host and start. start parses as run, so it
+// takes the same flags.
+func (a *app) opts(cmd *cli.Command) (opts, error) {
+	o := opts{
+		isolation: isolationFrom(cmd), mode: cmd.Name, dir: cmd.String("dir"),
+		lease: cmd.Duration("lease"), grace: cmd.Duration("grace"),
+		listen: cmd.String("listen"), tlsCert: cmd.String("tls-cert"), tlsKey: cmd.String("tls-key"),
+		tlsClientCA: cmd.String("tls-client-ca"), tlsAllow: cmd.StringSlice("tls-allow"),
+		print: cmd.Bool("print"), check: cmd.Bool("check"), verbose: cmd.Bool("verbose"),
+		detachHost: cmd.Bool("host"), argv: a.argv(cmd),
+	}
+	if o.mode == "start" {
+		o.mode = "run"
+	}
 	if len(o.argv) == 0 {
-		return o, fmt.Errorf("no command: %w", errUsage)
+		return o, errors.New("no command (give it after --)")
 	}
 	if o.mode == "host" && o.dir == "" {
 		return o, errors.New("host needs --dir")
@@ -108,33 +139,9 @@ func parse(args []string, stderr io.Writer) (opts, error) {
 
 // build turns the config and flag overrides into a Spec.
 func build(o opts, stdin io.Reader) (acphost.Spec, error) {
-	c, err := readConfig(o.config, stdin)
+	c, err := o.load(stdin)
 	if err != nil {
 		return acphost.Spec{}, err
-	}
-	if o.network != "" || len(o.ro) > 0 || len(o.rw) > 0 {
-		if c.Sandbox == nil {
-			c.Sandbox = &sandbox.Sandbox{}
-		}
-		if o.network != "" {
-			c.Sandbox.Network = o.network
-		}
-		for _, m := range o.ro {
-			c.Sandbox.RO = append(c.Sandbox.RO, parseMount(m))
-		}
-		for _, m := range o.rw {
-			c.Sandbox.RW = append(c.Sandbox.RW, parseMount(m))
-		}
-	}
-	for _, j := range o.join {
-		t, p, ok := strings.Cut(j, "=")
-		if !ok {
-			return acphost.Spec{}, fmt.Errorf("--join %q: want TYPE=PATH", j)
-		}
-		if c.Join == nil {
-			c.Join = map[string]string{}
-		}
-		c.Join[t] = p
 	}
 	dir := o.dir
 	if dir == "" {
@@ -186,59 +193,46 @@ func build(o opts, stdin io.Reader) (acphost.Spec, error) {
 	return s, nil
 }
 
-func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
-	if len(args) > 0 && isDetached(args[0]) {
-		return detached(args, stdin, stdout, stderr)
-	}
-	o, err := parse(args, stderr)
+// cmdRun is run and host.
+func (a *app) cmdRun(_ context.Context, cmd *cli.Command) error {
+	o, err := a.opts(cmd)
 	if err != nil {
-		if !errors.Is(err, flag.ErrHelp) {
-			say(stderr, "acphost:", err)
-		}
-		if errors.Is(err, errUsage) {
-			sayf(stderr, "%s", usage)
-		}
-		return 2
+		return err
 	}
 	if o.detachHost {
-		say(stderr, "acphost: --host is only for start (host already runs a host)")
-		return 2
+		return errors.New("--host is only for start (host already runs a host)")
 	}
-	s, err := build(o, stdin)
+	s, err := build(o, a.stdin)
 	if err != nil {
-		say(stderr, "acphost:", err)
-		return 2
+		return err
 	}
 	switch {
 	case o.check:
-		return check(s, stdout, stderr)
+		return exit(check(s, a.stdout, a.stderr))
 	case o.print:
-		return printPlan(s, stdout, stderr)
+		return exit(printPlan(s, a.stdout, a.stderr))
 	case o.mode == "host":
-		return host(o, s, stderr)
+		return exit(host(o, s, a.stderr))
 	}
 	if err := acphost.CheckSpawn(s, false); err != nil {
-		say(stderr, "acphost:", err)
-		return 125
+		return a.fail(125, err)
 	}
-	cmdIn := stdin
+	cmdIn := a.stdin
 	if o.config == "-" {
 		cmdIn = nil // stdin held the config
 	}
-	p, err := proc.Start(context.Background(), procSpec(s), proc.Stdin(cmdIn), proc.Stdout(stdout), proc.Stderr(stderr))
+	p, err := proc.Start(context.Background(), procSpec(s), proc.Stdin(cmdIn), proc.Stdout(a.stdout), proc.Stderr(a.stderr))
 	if err != nil {
-		say(stderr, "acphost:", err)
-		return 125
+		return a.fail(125, err)
 	}
 	ex, err := p.Wait()
 	if o.verbose {
-		writeJSON(stderr, p.Isolation())
+		writeJSON(a.stderr, p.Isolation())
 	}
 	if err != nil {
-		say(stderr, "acphost:", err)
-		return 125
+		return a.fail(125, err)
 	}
-	return exitCode(ex, stderr)
+	return exit(exitCode(ex, a.stderr))
 }
 
 func procSpec(s acphost.Spec) proc.Spec {
@@ -371,6 +365,3 @@ func writeJSON(w io.Writer, v any) {
 func say(w io.Writer, a ...any) { _, _ = fmt.Fprintln(w, a...) }
 
 func sayf(w io.Writer, format string, a ...any) { _, _ = fmt.Fprintf(w, format, a...) }
-
-// errUsage is returned for a bad command line; run prints usage.
-var errUsage = errors.New("bad usage")
