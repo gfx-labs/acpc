@@ -13,6 +13,9 @@ permissions:
 jobs:
   release-please:
     runs-on: ubicloud
+    # The App key is a secret of the release environment, which only
+    # master may deploy to.
+    environment: release
     steps:
       # An App token, not GITHUB_TOKEN: a PR opened with GITHUB_TOKEN gets
       # no CI runs, so the required checks never report on the release PR.
