@@ -84,7 +84,8 @@ cancels one. Output goes to an `acpc.Output` that gets journal frames.
 
 - The agent's `fs/*` and `terminal/*` client methods. The agent does its
   file and command work itself, inside its sandbox.
-- MCP server config.
+- MCP servers in `session/new`. acpc sends none: the agent reads its own
+  MCP config.
 
 ## Check
 
