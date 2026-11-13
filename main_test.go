@@ -14,6 +14,10 @@ import (
 func TestMain(m *testing.M) {
 	acphost.MaybeChild()
 	maybeFakeAgent()
+	// A queued --no-wait prompt is sent by this binary re-exec'd as acpc.
+	if len(os.Args) > 1 && os.Args[1] == "prompt" {
+		os.Exit(run(os.Args[1:], os.Stdin, os.Stdout, os.Stderr))
+	}
 	os.Exit(m.Run())
 }
 

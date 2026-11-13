@@ -170,8 +170,8 @@ func (s *session) create() int {
 }
 
 // turn sends one prompt and returns the exit status once the turn ended.
-func (s *session) turn(text string) int {
-	text, err := s.ready(text)
+func (s *session) turn(in promptInput) int {
+	req, err := s.ready(in)
 	if err != nil {
 		return s.report(err)
 	}
@@ -179,7 +179,7 @@ func (s *session) turn(text string) int {
 	var res acp.PromptResponse
 	err = s.wait(func(ctx context.Context) error {
 		var err error
-		res, err = s.link.conn.Prompt(ctx, s.promptRequest(text))
+		res, err = s.link.conn.Prompt(ctx, req)
 		return err
 	}, nil)
 	s.inTurn = false
@@ -191,18 +191,18 @@ func (s *session) turn(text string) int {
 	return code
 }
 
-// ready prepares the agent for a prompt and returns the text to send.
-func (s *session) ready(text string) (string, error) {
+// ready prepares the agent for a prompt and returns the request to send.
+func (s *session) ready(in promptInput) (acp.PromptRequest, error) {
 	seed, err := s.ensure()
 	if err != nil {
-		return "", err
+		return acp.PromptRequest{}, err
 	}
 	if seed != "" {
 		// Summarize drops everything up to SummaryEnd, so a later
 		// summary does not nest this one.
-		text = seed + "\n\n" + acphost.SummaryEnd + "\n\n" + text
+		in.Text = seed + "\n\n" + acphost.SummaryEnd + "\n\n" + in.Text
 	}
-	return text, nil
+	return s.promptRequest(in)
 }
 
 // submit sends one prompt and returns once the host has journaled it. A
@@ -211,12 +211,12 @@ func (s *session) ready(text string) (string, error) {
 // Prompt runs with a context that never ends: go-acp sends session/cancel
 // when it does. Closing the connection ends the call instead, and the turn
 // keeps running.
-func (s *session) submit(text string) int {
-	text, err := s.ready(text)
+func (s *session) submit(in promptInput) int {
+	req, err := s.ready(in)
 	if err != nil {
 		return s.report(err)
 	}
-	go func() { _, _ = s.link.conn.Prompt(context.Background(), s.promptRequest(text)) }()
+	go func() { _, _ = s.link.conn.Prompt(context.Background(), req) }()
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	go func() {
@@ -305,6 +305,9 @@ func (a *app) cmdPrompt(_ context.Context, cmd *cli.Command) error {
 	if err != nil {
 		return err
 	}
+	if path := cmd.String("queued"); path != "" {
+		return exit(a.runWaiter(t, path))
+	}
 	out, policy, err := turnOptions(cmd, a.stdout)
 	if err != nil {
 		return err
@@ -314,39 +317,147 @@ func (a *app) cmdPrompt(_ context.Context, cmd *cli.Command) error {
 	if err != nil {
 		return err
 	}
-	var config *Config
+	files, err := readAttachments(cmd.StringSlice("file"))
+	if err != nil {
+		return err
+	}
+	q := queued{Input: promptInput{Text: text, Files: files}, Policy: policy, NoWait: cmd.Bool("no-wait")}
 	if iso.set() {
 		c, err := iso.load(a.stdin)
 		if err != nil {
 			return err
 		}
-		config = &c
+		q.Config = &c
 	}
-	s, err := a.open(t, out, policy)
+	spec, err := readSessionSpec(t)
+	if err != nil {
+		return a.fail(1, err)
+	}
+	e, err := enqueue(t.dir, q)
+	if err != nil {
+		return a.fail(1, err)
+	}
+	handedOff := false
+	defer func() {
+		if !handedOff {
+			e.done()
+		}
+	}()
+	ahead := len(queueAhead(t.dir, filepath.Base(e.path)))
+	_, inUse := lockHolder(t.dir)
+	if q.NoWait && (ahead > 0 || inUse) {
+		handedOff = true
+		return exit(a.handOff(t, e, ahead))
+	}
+	if ahead > 0 || inUse {
+		sayf(a.stderr, "acpc: queued behind %d prompt(s) in %s\n", ahead+1, t)
+	}
+	s, err := a.useQueued(t, spec, out, policy, e)
+	if errors.Is(err, errInterrupted) {
+		return exit(130)
+	}
 	if err != nil {
 		return a.fail(1, err)
 	}
 	defer s.close()
-	if config != nil {
-		if err := s.reconfigure(*config); err != nil {
-			return exit(s.report(err))
+	if err := s.reach(q); err != nil {
+		return exit(s.report(err))
+	}
+	if q.NoWait && s.welcome.Busy {
+		// A turn started with --no-wait runs; a waiter sends this one after it.
+		s.close()
+		handedOff = true
+		return exit(a.handOff(t, e, 0))
+	}
+	if err := s.awaitRunning(); err != nil {
+		return exit(s.report(err))
+	}
+	if q.NoWait {
+		return exit(s.submit(q.Input))
+	}
+	return exit(s.turn(q.Input))
+}
+
+// handOff starts a detached waiter for the queued --no-wait prompt e.
+func (a *app) handOff(t target, e *entry, ahead int) int {
+	err := startWaiter(t, e)
+	_ = e.f.Close() // the waiter holds the lock now
+	if err != nil {
+		_ = os.Remove(e.path)
+		say(a.stderr, "acpc:", err)
+		return 1
+	}
+	sayf(a.stderr, "acpc: queued behind %d prompt(s) or a running turn in %s\n", ahead+1, t)
+	return 0
+}
+
+// runWaiter is a detached acpc for one queued --no-wait prompt: it waits
+// for its turn and sends the prompt. Its output is in queue.log; the turn
+// is shown by the next attach.
+func (a *app) runWaiter(t target, path string) int {
+	e, q, err := adopt(path, queuedFD)
+	if err != nil {
+		say(a.stderr, "acpc:", err)
+		return 1
+	}
+	defer e.done()
+	spec, err := readSessionSpec(t)
+	if err != nil {
+		say(a.stderr, "acpc:", err)
+		return 1
+	}
+	s, err := a.useQueued(t, spec, nil, q.Policy, e)
+	if err != nil {
+		say(a.stderr, "acpc:", err)
+		return 1
+	}
+	defer s.close()
+	if err := s.reach(q); err != nil {
+		return s.report(err)
+	}
+	if err := s.awaitRunning(); err != nil {
+		return s.report(err)
+	}
+	return s.submit(q.Input)
+}
+
+// reach applies q's isolation, starts the host if needed and connects.
+// A config change waits for a turn started with --no-wait: the host is
+// restarted with the new isolation once it is idle.
+func (s *session) reach(q queued) error {
+	if q.Config != nil && acphost.Alive(s.t.dir) {
+		if err := s.connect(); err != nil {
+			return err
+		}
+		if err := s.awaitRunning(); err != nil {
+			return err
+		}
+		s.link.close()
+		s.link = nil
+	}
+	if q.Config != nil {
+		if err := s.reconfigure(*q.Config); err != nil {
+			return err
 		}
 	}
 	if err := s.start(); err != nil {
-		return exit(s.report(err))
+		return err
 	}
-	if err := s.connect(); err != nil {
-		return exit(s.report(err))
-	}
-	if s.welcome.Busy {
-		return exit(s.report(fmt.Errorf("a turn is running in %s (attach waits for it, cancel stops it)", t)))
-	}
-	// What an earlier turn left unseen comes first.
+	return s.connect()
+}
+
+// awaitRunning shows what the journal has unseen and, if a turn started
+// with --no-wait is running, shows it and waits for its end.
+func (s *session) awaitRunning() error {
 	s.catchUp()
-	if cmd.Bool("no-wait") {
-		return exit(s.submit(text))
+	if !s.welcome.Busy {
+		return nil
 	}
-	return exit(s.turn(text))
+	if _, err := s.awaitTurn(); err != nil {
+		return err
+	}
+	s.out.end()
+	return nil
 }
 
 func (a *app) cmdExec(_ context.Context, cmd *cli.Command) error {
@@ -359,6 +470,10 @@ func (a *app) cmdExec(_ context.Context, cmd *cli.Command) error {
 	}
 	iso := isolationFrom(cmd)
 	text, err := a.promptText(cmd.Args().Slice(), iso.config == "-")
+	if err != nil {
+		return err
+	}
+	files, err := readAttachments(cmd.StringSlice("file"))
 	if err != nil {
 		return err
 	}
@@ -380,7 +495,7 @@ func (a *app) cmdExec(_ context.Context, cmd *cli.Command) error {
 	s.trace = out.format == formatText
 	code := s.create()
 	if code == 0 {
-		code = s.turn(text)
+		code = s.turn(promptInput{Text: text, Files: files})
 	}
 	s.close()
 	if err := stopHost(dir); err != nil {
@@ -434,6 +549,19 @@ func (a *app) cmdCancel(_ context.Context, cmd *cli.Command) error {
 	if _, err := readSessionSpec(t); err != nil {
 		return a.fail(1, err)
 	}
+	if cmd.Bool("queued") {
+		if n := clearQueue(t.dir); n > 0 {
+			sayf(a.stderr, "acpc: dropped %d queued prompt(s)\n", n)
+		}
+	}
+	// Queued prompts wait for the client lock. cancel takes a place at the
+	// front of the queue first, so none of them starts a turn between the
+	// interrupted client letting go and cancel connecting.
+	front, err := enqueueFront(t.dir)
+	if err != nil {
+		return a.fail(1, err)
+	}
+	defer front.done()
 	// A client using the session owns the connection: a second one would
 	// replace it. Interrupting it makes a prompt cancel its turn and wait
 	// for the agent to end it, and an attach let go.

@@ -14,6 +14,8 @@ import (
 	"strings"
 	"sync/atomic"
 
+	acp "github.com/gfx-labs/go-acp"
+
 	"github.com/gfx-labs/acphost/pkg/acphost"
 	"github.com/gfx-labs/acphost/pkg/proc"
 	"golang.org/x/sys/unix"
@@ -232,6 +234,7 @@ type session struct {
 	out    *output // nil leaves the journal unread
 	off    int64   // journal offset read so far
 	policy string  // permission policy
+	caps   acp.PromptCapabilities
 
 	muted      bool        // read the journal without showing it
 	trace      bool        // show the handshake steps (exec with --format text)
@@ -243,10 +246,19 @@ type session struct {
 // use takes the client lock of the session in t, whose host runs spec, and
 // starts catching the signals that cancel a turn.
 func (a *app) use(t target, spec acphost.Spec, out *output, policy string) (*session, error) {
+	return a.useWith(t, spec, out, policy, func(<-chan os.Signal) (func(), error) { return lockClient(t) })
+}
+
+// useQueued is use for the prompt queued as e: it waits for its turn.
+func (a *app) useQueued(t target, spec acphost.Spec, out *output, policy string, e *entry) (*session, error) {
+	return a.useWith(t, spec, out, policy, func(sigs <-chan os.Signal) (func(), error) { return waitTurn(t, e, sigs) })
+}
+
+func (a *app) useWith(t target, spec acphost.Spec, out *output, policy string, lock func(<-chan os.Signal) (func(), error)) (*session, error) {
 	// Before the lock: cancel signals whoever holds it.
 	sigs := make(chan os.Signal, 2)
 	signal.Notify(sigs, unix.SIGINT, unix.SIGTERM)
-	unlock, err := lockClient(t)
+	unlock, err := lock(sigs)
 	if err != nil {
 		signal.Stop(sigs)
 		return nil, err

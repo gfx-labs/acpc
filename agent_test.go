@@ -24,6 +24,7 @@ const (
 	agentLoads     = "load"     // session/load works and replays a message
 	agentLoadFails = "loadfail" // session/load is offered and fails
 	agentQuits     = "quit"     // exits 3 on initialize
+	agentPlain     = "plain"    // no image or embeddedContext prompt capability
 )
 
 // fakeAgentCommand is the agent command line for a test, with the "--".
@@ -61,8 +62,26 @@ type (
 	initializeResult struct {
 		ProtocolVersion   int `json:"protocolVersion"`
 		AgentCapabilities struct {
-			LoadSession bool `json:"loadSession"`
+			LoadSession        bool `json:"loadSession"`
+			PromptCapabilities struct {
+				Image           bool `json:"image"`
+				EmbeddedContext bool `json:"embeddedContext"`
+			} `json:"promptCapabilities"`
 		} `json:"agentCapabilities"`
+	}
+	// promptBlock is a content block of a prompt, as the fake agent reads it.
+	promptBlock struct {
+		Type     string `json:"type"`
+		Text     string `json:"text"`
+		MimeType string `json:"mimeType"`
+		URI      string `json:"uri"`
+		Data     string `json:"data"`
+		Resource struct {
+			URI      string `json:"uri"`
+			MimeType string `json:"mimeType"`
+			Text     string `json:"text"`
+			Blob     string `json:"blob"`
+		} `json:"resource"`
 	}
 	sessionParams struct {
 		SessionID string `json:"sessionId"`
@@ -71,7 +90,7 @@ type (
 		SessionID string `json:"sessionId"`
 	}
 	promptParams struct {
-		Prompt []contentText `json:"prompt"`
+		Prompt []promptBlock `json:"prompt"`
 	}
 	promptResult struct {
 		StopReason string `json:"stopReason"`
@@ -148,6 +167,10 @@ func (a *fakeAgent) handle(m message) {
 		}
 		res := initializeResult{ProtocolVersion: 1}
 		res.AgentCapabilities.LoadSession = a.mode == agentLoads || a.mode == agentLoadFails
+		// The default agent takes images and embedded files; "plain" only
+		// the baseline, text and resource links.
+		res.AgentCapabilities.PromptCapabilities.Image = a.mode != agentPlain
+		res.AgentCapabilities.PromptCapabilities.EmbeddedContext = a.mode != agentPlain
 		a.send(message{ID: m.ID, Result: rawJSON(res)})
 	case "session/new":
 		a.session = fmt.Sprintf("sess-%d", os.Getpid())
@@ -193,6 +216,18 @@ func (a *fakeAgent) turn(m message) {
 	stop := "end_turn"
 	switch {
 	case len(words) == 0:
+	case words[0] == "blocks":
+		// One line per block after the text: type, mime type, uri, size.
+		for _, b := range p.Prompt[1:] {
+			uri, mt, size := b.URI, b.MimeType, len(b.Resource.Text)+len(b.Resource.Blob)
+			if b.Type == "resource" {
+				uri, mt = b.Resource.URI, b.Resource.MimeType
+			}
+			if b.Type == "image" {
+				size = len(b.Data)
+			}
+			a.say(fmt.Sprintf("block %s %s %s %d\n", b.Type, mt, uri, size))
+		}
 	case words[0] == "ask":
 		a.say("permission: " + a.ask(arg) + "\n")
 	case words[0] == "hold":

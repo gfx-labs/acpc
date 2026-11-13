@@ -357,6 +357,7 @@ func (s *session) ensure() (seed string, err error) {
 		s.tracef("[client] initialized protocol version %d, agent %s %s, loadSession %t",
 			init.ProtocolVersion, agent.Name, agent.Version, init.AgentCapabilities.LoadSession)
 	}
+	s.caps = init.AgentCapabilities.PromptCapabilities
 	switch {
 	case s.state.ACPSession == "":
 		return "", s.newSession()
@@ -412,12 +413,13 @@ func (s *session) opened(id string) error {
 	return writeState(s.t.dir, s.state)
 }
 
-// promptRequest is a session/prompt with one text block.
-func (s *session) promptRequest(text string) acp.PromptRequest {
-	return acp.PromptRequest{
-		SessionId: acp.SessionId(s.state.ACPSession),
-		Prompt:    []acp.ContentBlock{{Text: &acp.ContentBlockText{Type: "text", Text: text}}},
+// promptRequest is the session/prompt for in.
+func (s *session) promptRequest(in promptInput) (acp.PromptRequest, error) {
+	blocks, err := contentBlocks(in, s.caps)
+	if err != nil {
+		return acp.PromptRequest{}, err
 	}
+	return acp.PromptRequest{SessionId: acp.SessionId(s.state.ACPSession), Prompt: blocks}, nil
 }
 
 // awaitTurn waits for a turn another connection started. The host reports
