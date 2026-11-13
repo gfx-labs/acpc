@@ -412,6 +412,7 @@ func TestExec(t *testing.T) {
 		stderr string
 	}{
 		"text":            {args: []string{"--format", "quiet", "hi", "there"}, stdout: `^sess-\d+> hi there\n$`},
+		"handshake":       {args: []string{"hi"}, stdout: `(?s)^\[acphost\] spawning agent: .*\[client\] initialize \(running\)\n\[client\] initialized .*\[client\] session/new .*\[client\] session sess-\d+\n=== turn .*end_turn\n$`},
 		"stdin":           {args: []string{"--format", "quiet"}, stdin: "from stdin", stdout: `^sess-\d+> from stdin\n$`},
 		"config":          {args: []string{"-c", cfg, "--format", "quiet", "env", "FOO"}, stdout: `^FOO=bar\n$`},
 		"stop reason":     {args: []string{"stop", "max_tokens"}, code: 1, stderr: "the turn stopped: max_tokens"},

@@ -242,6 +242,7 @@ type session struct {
 	policy string  // permission policy
 
 	muted      bool // read the journal without showing it
+	trace      bool // show the handshake steps (exec with --format text)
 	inTurn     bool // a signal cancels the turn instead of ending the command
 	cancelling bool // session/cancel was sent
 	interrupts int
@@ -306,9 +307,12 @@ func (s *session) start() error {
 	if err := acphost.CheckSpawn(s.spec, false, acphost.WithHostDir(s.t.dir)); err != nil {
 		return &spawnError{err}
 	}
-	if _, err := acphost.StartDetached(s.t.dir, nil); err != nil {
+	s.tracef("[acphost] spawning agent: %s", strings.Join(append([]string{s.spec.Command}, s.spec.Args...), " "))
+	d, err := acphost.StartDetached(s.t.dir, nil)
+	if err != nil {
 		return &spawnError{err}
 	}
+	s.tracef("[acphost] host pid %d", d.Pid)
 	return nil
 }
 

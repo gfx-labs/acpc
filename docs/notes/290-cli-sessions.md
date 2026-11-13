@@ -48,7 +48,9 @@ to fit in 107 bytes. Names are up to 32 letters, digits, `.`, `_` or `-`.
   `session/prompt` and shows the turn. The text is the arguments joined by
   spaces, or stdin with no arguments or `-`. `--no-wait` returns once the
   journal has the prompt.
-- `exec` is `new`, one `prompt` and `rm` on a temporary directory.
+- `exec` is `new`, one `prompt` and `rm` on a temporary directory. With
+  `--format text` it writes each handshake step (spawn, `initialize`,
+  `session/new`) as it happens, as acpx does (2026-11-13).
 - `attach` shows what the journal gained since this client last looked,
   and if a turn is running waits for its end. Ctrl-C ends `attach`, not
   the turn.

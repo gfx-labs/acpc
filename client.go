@@ -72,6 +72,11 @@ type (
 		Version string `json:"version"`
 	}
 	initializeResult struct {
+		ProtocolVersion int `json:"protocolVersion"`
+		AgentInfo       struct {
+			Name    string `json:"name"`
+			Version string `json:"version"`
+		} `json:"agentInfo"`
 		AgentCapabilities struct {
 			LoadSession bool `json:"loadSession"`
 		} `json:"agentCapabilities"`
@@ -181,6 +186,14 @@ func (l *link) close() {
 func rawJSON(v any) json.RawMessage {
 	b, _ := json.Marshal(v)
 	return b
+}
+
+// tracef writes a step of the ACP handshake when the session traces them.
+// Steps are written as they happen, before the frames they cause.
+func (s *session) tracef(format string, args ...any) {
+	if s.trace && s.out != nil {
+		sayf(s.out.w, format+"\n", args...)
+	}
 }
 
 func (s *session) journal() string { return filepath.Join(s.t.dir, acphost.JournalFile) }
@@ -379,7 +392,9 @@ func (s *session) ensure() (seed string, err error) {
 		s.muted = false
 	}()
 	init := s.welcome.Initialize
-	if len(init) == 0 {
+	sent := len(init) == 0
+	if sent {
+		s.tracef("[client] initialize (running)")
 		init, err = s.call("initialize", initializeParams{
 			ProtocolVersion: acpProtocolVersion,
 			ClientInfo:      clientInfo{Name: "acphost", Version: version()},
@@ -387,9 +402,14 @@ func (s *session) ensure() (seed string, err error) {
 		if err != nil {
 			return "", err
 		}
+		s.welcome.Initialize = init
 	}
 	var caps initializeResult
 	_ = json.Unmarshal(init, &caps)
+	if sent {
+		s.tracef("[client] initialized protocol version %d, agent %s %s, loadSession %t",
+			caps.ProtocolVersion, caps.AgentInfo.Name, caps.AgentInfo.Version, caps.AgentCapabilities.LoadSession)
+	}
 	switch {
 	case s.state.ACPSession == "":
 		return "", s.newSession()
@@ -397,6 +417,7 @@ func (s *session) ensure() (seed string, err error) {
 		return "", nil
 	}
 	if caps.AgentCapabilities.LoadSession {
+		s.tracef("[client] session/load %s (running)", s.state.ACPSession)
 		_, err := s.call("session/load", sessionParams{SessionID: s.state.ACPSession, Cwd: s.spec.Dir, McpServers: []string{}})
 		if err == nil {
 			return "", s.opened(s.state.ACPSession)
@@ -415,6 +436,7 @@ func (s *session) ensure() (seed string, err error) {
 }
 
 func (s *session) newSession() error {
+	s.tracef("[client] session/new cwd %s (running)", s.spec.Dir)
 	res, err := s.call("session/new", sessionParams{Cwd: s.spec.Dir, McpServers: []string{}})
 	if err != nil {
 		return err
@@ -423,6 +445,7 @@ func (s *session) newSession() error {
 	if err := json.Unmarshal(res, &r); err != nil || r.SessionID == "" {
 		return fmt.Errorf("session/new: no sessionId in %s", res)
 	}
+	s.tracef("[client] session %s", r.SessionID)
 	return s.opened(r.SessionID)
 }
 

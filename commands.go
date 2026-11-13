@@ -377,6 +377,8 @@ func (a *app) cmdExec(_ context.Context, cmd *cli.Command) error {
 	if err != nil {
 		return a.fail(1, err)
 	}
+	// As acpx does, exec shows the handshake as it happens.
+	s.trace = out.format == formatText
 	code := s.create()
 	if code == 0 {
 		code = s.turn(text)
