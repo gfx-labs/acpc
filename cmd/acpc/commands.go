@@ -12,12 +12,13 @@ import (
 	"text/tabwriter"
 	"time"
 
+	"github.com/gfx-labs/acpc/pkg/acpc"
+
 	acp "github.com/gfx-labs/go-acp"
 
 	"github.com/gfx-labs/acphost/pkg/acphost"
 	"github.com/gfx-labs/acphost/pkg/proc"
 	"github.com/urfave/cli/v3"
-	"golang.org/x/sys/unix"
 )
 
 // Session commands: new, prompt, exec, attach, cancel, ls and rm. See
@@ -31,8 +32,6 @@ const (
 	// execLease only matters if exec is killed: it is connected until it
 	// stops its host.
 	execLease = time.Minute
-	// stopGrace bounds the wait for a host to stop before it is killed.
-	stopGrace = 30 * time.Second
 )
 
 // output shows journal frames in one of the formats.
@@ -43,7 +42,7 @@ type output struct {
 	open   bool // quiet: the agent's text has not ended its line
 }
 
-func (o *output) frame(fr acphost.Frame) {
+func (o *output) Frame(fr acphost.Frame) {
 	switch o.format {
 	case formatJSON:
 		_, _ = o.w.Write(acphost.RawFrame(fr))
@@ -57,8 +56,8 @@ func (o *output) frame(fr acphost.Frame) {
 	}
 }
 
-// end finishes the last line of quiet output.
-func (o *output) end() {
+// End finishes the last line of quiet output.
+func (o *output) End() {
 	if o != nil && o.open {
 		_, _ = io.WriteString(o.w, "\n")
 		o.open = false
@@ -90,8 +89,8 @@ func turnOptions(cmd *cli.Command, w io.Writer) (*output, string, error) {
 	if format != formatText && format != formatJSON && format != formatQuiet {
 		return nil, "", fmt.Errorf("--format %q: want text, json or quiet", format)
 	}
-	policy, n := approveReads, 0
-	for _, p := range []string{approveAll, approveReads, denyAll} {
+	policy, n := acpc.ApproveReads, 0
+	for _, p := range []string{acpc.ApproveAll, acpc.ApproveReads, acpc.DenyAll} {
 		if cmd.Bool(p) {
 			policy = p
 			n++
@@ -144,103 +143,81 @@ func (a *app) sessionSpec(name string, iso isolation, lease time.Duration, argv 
 
 // hostName is Spec.Session for t: one path element (a cgroup and a GC
 // root are named after it) that differs between working directories.
-func hostName(t target) string {
-	if t.name == "" {
-		return filepath.Base(t.dir)
+func hostName(t acpc.Target) string {
+	if t.Name == "" {
+		return filepath.Base(t.Dir)
 	}
-	return filepath.Base(filepath.Dir(t.dir)) + "-" + t.name
+	return filepath.Base(filepath.Dir(t.Dir)) + "-" + t.Name
 }
 
-// create writes the spec, starts the host and opens an ACP session.
-func (s *session) create() int {
-	if err := acphost.WriteSpec(s.t.dir, s.spec); err != nil {
-		return s.report(err)
+// options are the acpc.Options for a command's session.
+func (a *app) options(out *output, policy string) acpc.Options {
+	o := acpc.Options{Policy: policy, Log: prefixed{a.stderr}, ClientInfo: acp.Implementation{Name: "acpc", Version: version()}}
+	if out != nil {
+		o.Output = out
 	}
-	if err := s.start(); err != nil {
-		return s.report(err)
-	}
-	if err := s.connect(); err != nil {
-		return s.report(err)
-	}
-	s.catchUp()
-	if _, err := s.ensure(); err != nil {
-		return s.report(err)
-	}
-	return 0
+	return o
 }
 
-// turn sends one prompt and returns the exit status once the turn ended.
-func (s *session) turn(in promptInput) int {
-	req, err := s.ready(in)
-	if err != nil {
-		return s.report(err)
+// prefixed writes the session's notices with an "acpc: " prefix.
+type prefixed struct{ w io.Writer }
+
+func (p prefixed) Write(b []byte) (int, error) {
+	if _, err := io.WriteString(p.w, "acpc: "); err != nil {
+		return 0, err
 	}
-	s.inTurn = true
-	var res acp.PromptResponse
-	err = s.wait(func(ctx context.Context) error {
-		var err error
-		res, err = s.link.conn.Prompt(ctx, req)
-		return err
-	}, nil)
-	s.inTurn = false
-	if err != nil {
-		err = fmt.Errorf("session/prompt: %w", err)
+	return p.w.Write(b)
+}
+
+// report prints err and returns the exit status for it: 130 for an
+// interrupt, 125 for a host that could not start, else 1. For a host that
+// stopped it adds the end of the host's log, where the agent's stderr is.
+func (a *app) report(dir string, err error) int {
+	if errors.Is(err, acpc.ErrInterrupted) {
+		return 130
 	}
-	code := s.turnStatus(res.StopReason, err)
-	s.out.end()
+	say(a.stderr, "acpc:", err)
+	var gone *acpc.HostGoneError
+	if errors.As(err, &gone) {
+		if tail := acpc.HostLogTail(dir); tail != "" {
+			sayf(a.stderr, "acpc: end of %s:\n%s\n", filepath.Join(dir, acphost.LogFile), tail)
+		}
+		// bwrap reports a command it cannot run after the host is up.
+		if gone.Exit.Reason == acphost.ReasonSpawnFailed {
+			return 125
+		}
+	}
+	var spawn *acpc.SpawnError
+	if errors.As(err, &spawn) {
+		return 125
+	}
+	return 1
+}
+
+// turnStatus is the exit status for a finished turn: 0 for end_turn, 130
+// for a cancelled one, 1 for any other stop reason or an error.
+func (a *app) turnStatus(dir string, stop acp.StopReason, err error) int {
+	if err != nil {
+		return a.report(dir, err)
+	}
+	switch stop {
+	case acp.StopReasonEndTurn:
+		return 0
+	case acp.StopReasonCancelled:
+		return 130
+	}
+	say(a.stderr, "acpc: the turn stopped:", stop)
+	return 1
+}
+
+// turn sends in on s and returns the exit status once the turn ended.
+func (a *app) turn(s *acpc.Session, dir string, out *output, in acpc.PromptInput) int {
+	stop, err := s.Prompt(in)
+	code := a.turnStatus(dir, stop, err)
+	if out != nil {
+		out.End()
+	}
 	return code
-}
-
-// ready prepares the agent for a prompt and returns the request to send.
-func (s *session) ready(in promptInput) (acp.PromptRequest, error) {
-	seed, err := s.ensure()
-	if err != nil {
-		return acp.PromptRequest{}, err
-	}
-	if seed != "" {
-		// Summarize drops everything up to SummaryEnd, so a later
-		// summary does not nest this one.
-		in.Text = seed + "\n\n" + acphost.SummaryEnd + "\n\n" + in.Text
-	}
-	return s.promptRequest(in)
-}
-
-// submit sends one prompt and returns once the host has journaled it. A
-// client that disconnected or was replaced sooner could lose the prompt:
-// the host closes a replaced connection without reading what is left on it.
-// Prompt runs with a context that never ends: go-acp sends session/cancel
-// when it does. Closing the connection ends the call instead, and the turn
-// keeps running.
-func (s *session) submit(in promptInput) int {
-	req, err := s.ready(in)
-	if err != nil {
-		return s.report(err)
-	}
-	go func() { _, _ = s.link.conn.Prompt(context.Background(), req) }()
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	go func() {
-		select {
-		case <-s.link.served:
-		case <-s.sigs:
-		case <-ctx.Done():
-		}
-		cancel()
-	}()
-	taken := false
-	err = acphost.FollowJournal(ctx, s.journal(), s.off, func(fr acphost.Frame) {
-		if fr.From == "controller" && frameMethod(fr) == "session/prompt" {
-			taken = true
-			cancel()
-		}
-	})
-	if err != nil {
-		return s.report(err)
-	}
-	if !taken {
-		return s.report(errors.New("stopped before the host took the prompt"))
-	}
-	return 0
 }
 
 func (a *app) cmdNew(_ context.Context, cmd *cli.Command) error {
@@ -248,60 +225,41 @@ func (a *app) cmdNew(_ context.Context, cmd *cli.Command) error {
 	if len(argv) == 0 {
 		return errors.New("new: no agent command (give it after --)")
 	}
-	t, err := resolve(cmd.String("session"), cmd.String("dir"), defaultSession)
+	t, err := acpc.Resolve(cmd.String("session"), cmd.String("dir"), acpc.DefaultSession)
 	if err != nil {
 		return err
 	}
-	if _, err := os.Stat(filepath.Join(t.dir, acphost.SpecFile)); err == nil {
+	if _, err := os.Stat(filepath.Join(t.Dir, acphost.SpecFile)); err == nil {
 		return a.fail(1, fmt.Errorf("%s already exists", t))
 	}
 	spec, err := a.sessionSpec(hostName(t), isolationFrom(cmd), cmd.Duration("lease"), argv)
 	if err != nil {
 		return err
 	}
-	if err := os.MkdirAll(t.dir, 0o700); err != nil {
+	if err := os.MkdirAll(t.Dir, 0o700); err != nil {
 		return a.fail(1, err)
 	}
 	// Nothing of new is shown, but the journal is read: the first prompt
 	// then starts after the handshake.
-	s, err := a.use(t, spec, &output{w: io.Discard, format: formatQuiet}, denyAll)
+	s, err := acpc.Open(t, spec, a.options(&output{w: io.Discard, format: formatQuiet}, acpc.DenyAll))
 	if err != nil {
 		return a.fail(1, err)
 	}
-	code := s.create()
-	s.close()
-	if code != 0 {
-		a.discard(t)
+	err = s.Create()
+	s.Close()
+	if err != nil {
+		code := a.report(t.Dir, err)
+		if err := acpc.Discard(t); err != nil {
+			say(a.stderr, "acpc:", err)
+		}
 		return exit(code)
 	}
-	say(a.stdout, t.dir)
+	say(a.stdout, t.Dir)
 	return nil
 }
 
-// discard removes a session that could not be created.
-func (a *app) discard(t target) {
-	if err := stopHost(t.dir); err != nil {
-		say(a.stderr, "acphost:", err)
-	}
-	if t.name == "" {
-		// A directory the user named: only what makes it a session goes.
-		for _, f := range []string{acphost.SpecFile, stateFile, lockFile} {
-			_ = os.Remove(filepath.Join(t.dir, f))
-		}
-		return
-	}
-	removeNamed(t)
-}
-
-// removeNamed deletes a named session's directory, and its working
-// directory's when that was the last session in it.
-func removeNamed(t target) {
-	_ = os.RemoveAll(t.dir)
-	_ = os.Remove(filepath.Dir(t.dir))
-}
-
 func (a *app) cmdPrompt(_ context.Context, cmd *cli.Command) error {
-	t, err := resolve(cmd.String("session"), cmd.String("dir"), defaultSession)
+	t, err := acpc.Resolve(cmd.String("session"), cmd.String("dir"), acpc.DefaultSession)
 	if err != nil {
 		return err
 	}
@@ -317,11 +275,11 @@ func (a *app) cmdPrompt(_ context.Context, cmd *cli.Command) error {
 	if err != nil {
 		return err
 	}
-	files, err := readAttachments(cmd.StringSlice("file"))
+	files, err := acpc.ReadAttachments(cmd.StringSlice("file"))
 	if err != nil {
 		return err
 	}
-	q := queued{Input: promptInput{Text: text, Files: files}, Policy: policy, NoWait: cmd.Bool("no-wait")}
+	q := acpc.Queued{Input: acpc.PromptInput{Text: text, Files: files}, Policy: policy, NoWait: cmd.Bool("no-wait")}
 	if iso.set() {
 		c, err := iso.load(a.stdin)
 		if err != nil {
@@ -329,22 +287,22 @@ func (a *app) cmdPrompt(_ context.Context, cmd *cli.Command) error {
 		}
 		q.Config = &c
 	}
-	spec, err := readSessionSpec(t)
+	spec, err := acpc.ReadSessionSpec(t)
 	if err != nil {
 		return a.fail(1, err)
 	}
-	e, err := enqueue(t.dir, q)
+	e, err := acpc.Enqueue(t.Dir, q)
 	if err != nil {
 		return a.fail(1, err)
 	}
 	handedOff := false
 	defer func() {
 		if !handedOff {
-			e.done()
+			e.Done()
 		}
 	}()
-	ahead := len(queueAhead(t.dir, filepath.Base(e.path)))
-	_, inUse := lockHolder(t.dir)
+	ahead := len(acpc.QueueAhead(t.Dir, filepath.Base(e.Path)))
+	_, inUse := acpc.LockHolder(t.Dir)
 	if q.NoWait && (ahead > 0 || inUse) {
 		handedOff = true
 		return exit(a.handOff(t, e, ahead))
@@ -352,38 +310,44 @@ func (a *app) cmdPrompt(_ context.Context, cmd *cli.Command) error {
 	if ahead > 0 || inUse {
 		sayf(a.stderr, "acpc: queued behind %d prompt(s) in %s\n", ahead+1, t)
 	}
-	s, err := a.useQueued(t, spec, out, policy, e)
-	if errors.Is(err, errInterrupted) {
+	s, err := acpc.OpenQueued(t, spec, a.options(out, policy), e)
+	if errors.Is(err, acpc.ErrInterrupted) {
 		return exit(130)
 	}
 	if err != nil {
 		return a.fail(1, err)
 	}
-	defer s.close()
-	if err := s.reach(q); err != nil {
-		return exit(s.report(err))
+	defer s.Close()
+	if err := s.Reach(q); err != nil {
+		return exit(a.report(t.Dir, err))
 	}
-	if q.NoWait && s.welcome.Busy {
+	if q.NoWait && s.Busy() {
 		// A turn started with --no-wait runs; a waiter sends this one after it.
-		s.close()
+		s.Close()
 		handedOff = true
 		return exit(a.handOff(t, e, 0))
 	}
-	if err := s.awaitRunning(); err != nil {
-		return exit(s.report(err))
+	if err := s.AwaitRunning(); err != nil {
+		return exit(a.report(t.Dir, err))
 	}
 	if q.NoWait {
-		return exit(s.submit(q.Input))
+		if err := s.Submit(q.Input); err != nil {
+			return exit(a.report(t.Dir, err))
+		}
+		return nil
 	}
-	return exit(s.turn(q.Input))
+	return exit(a.turn(s, t.Dir, out, q.Input))
 }
 
 // handOff starts a detached waiter for the queued --no-wait prompt e.
-func (a *app) handOff(t target, e *entry, ahead int) int {
-	err := startWaiter(t, e)
-	_ = e.f.Close() // the waiter holds the lock now
+func (a *app) handOff(t acpc.Target, e *acpc.Entry, ahead int) int {
+	exe, err := os.Executable()
+	if err == nil {
+		err = acpc.StartWaiter(t, e, []string{exe, "prompt", "--dir", t.Dir, "--queued", e.Path})
+	}
+	_ = e.File.Close() // the waiter holds the lock now
 	if err != nil {
-		_ = os.Remove(e.path)
+		_ = os.Remove(e.Path)
 		say(a.stderr, "acpc:", err)
 		return 1
 	}
@@ -394,70 +358,34 @@ func (a *app) handOff(t target, e *entry, ahead int) int {
 // runWaiter is a detached acpc for one queued --no-wait prompt: it waits
 // for its turn and sends the prompt. Its output is in queue.log; the turn
 // is shown by the next attach.
-func (a *app) runWaiter(t target, path string) int {
-	e, q, err := adopt(path, queuedFD)
+func (a *app) runWaiter(t acpc.Target, path string) int {
+	e, q, err := acpc.Adopt(path, acpc.QueuedFD)
 	if err != nil {
 		say(a.stderr, "acpc:", err)
 		return 1
 	}
-	defer e.done()
-	spec, err := readSessionSpec(t)
+	defer e.Done()
+	spec, err := acpc.ReadSessionSpec(t)
 	if err != nil {
 		say(a.stderr, "acpc:", err)
 		return 1
 	}
-	s, err := a.useQueued(t, spec, nil, q.Policy, e)
+	s, err := acpc.OpenQueued(t, spec, a.options(nil, q.Policy), e)
 	if err != nil {
 		say(a.stderr, "acpc:", err)
 		return 1
 	}
-	defer s.close()
-	if err := s.reach(q); err != nil {
-		return s.report(err)
+	defer s.Close()
+	if err := s.Reach(q); err != nil {
+		return a.report(t.Dir, err)
 	}
-	if err := s.awaitRunning(); err != nil {
-		return s.report(err)
+	if err := s.AwaitRunning(); err != nil {
+		return a.report(t.Dir, err)
 	}
-	return s.submit(q.Input)
-}
-
-// reach applies q's isolation, starts the host if needed and connects.
-// A config change waits for a turn started with --no-wait: the host is
-// restarted with the new isolation once it is idle.
-func (s *session) reach(q queued) error {
-	if q.Config != nil && acphost.Alive(s.t.dir) {
-		if err := s.connect(); err != nil {
-			return err
-		}
-		if err := s.awaitRunning(); err != nil {
-			return err
-		}
-		s.link.close()
-		s.link = nil
+	if err := s.Submit(q.Input); err != nil {
+		return a.report(t.Dir, err)
 	}
-	if q.Config != nil {
-		if err := s.reconfigure(*q.Config); err != nil {
-			return err
-		}
-	}
-	if err := s.start(); err != nil {
-		return err
-	}
-	return s.connect()
-}
-
-// awaitRunning shows what the journal has unseen and, if a turn started
-// with --no-wait is running, shows it and waits for its end.
-func (s *session) awaitRunning() error {
-	s.catchUp()
-	if !s.welcome.Busy {
-		return nil
-	}
-	if _, err := s.awaitTurn(); err != nil {
-		return err
-	}
-	s.out.end()
-	return nil
+	return 0
 }
 
 func (a *app) cmdExec(_ context.Context, cmd *cli.Command) error {
@@ -473,7 +401,7 @@ func (a *app) cmdExec(_ context.Context, cmd *cli.Command) error {
 	if err != nil {
 		return err
 	}
-	files, err := readAttachments(cmd.StringSlice("file"))
+	files, err := acpc.ReadAttachments(cmd.StringSlice("file"))
 	if err != nil {
 		return err
 	}
@@ -482,23 +410,28 @@ func (a *app) cmdExec(_ context.Context, cmd *cli.Command) error {
 		return a.fail(1, err)
 	}
 	defer func() { _ = os.RemoveAll(dir) }()
-	t := target{dir: dir}
+	t := acpc.Target{Dir: dir}
 	spec, err := a.sessionSpec(hostName(t), iso, execLease, a.rest)
 	if err != nil {
 		return err
 	}
-	s, err := a.use(t, spec, out, policy)
+	opts := a.options(out, policy)
+	// As acpx does, exec shows the handshake as it happens.
+	if out.format == formatText {
+		opts.Trace = out.w
+	}
+	s, err := acpc.Open(t, spec, opts)
 	if err != nil {
 		return a.fail(1, err)
 	}
-	// As acpx does, exec shows the handshake as it happens.
-	s.trace = out.format == formatText
-	code := s.create()
-	if code == 0 {
-		code = s.turn(promptInput{Text: text, Files: files})
+	code := 0
+	if err := s.Create(); err != nil {
+		code = a.report(dir, err)
+	} else {
+		code = a.turn(s, dir, out, acpc.PromptInput{Text: text, Files: files})
 	}
-	s.close()
-	if err := stopHost(dir); err != nil {
+	s.Close()
+	if err := acpc.StopHost(dir); err != nil {
 		say(a.stderr, "acpc:", err)
 	}
 	return exit(code)
@@ -508,7 +441,7 @@ func (a *app) cmdAttach(_ context.Context, cmd *cli.Command) error {
 	if cmd.NArg() > 0 || len(a.rest) > 0 {
 		return errors.New("attach takes no arguments")
 	}
-	t, err := resolve(cmd.String("session"), cmd.String("dir"), defaultSession)
+	t, err := acpc.Resolve(cmd.String("session"), cmd.String("dir"), acpc.DefaultSession)
 	if err != nil {
 		return err
 	}
@@ -516,74 +449,75 @@ func (a *app) cmdAttach(_ context.Context, cmd *cli.Command) error {
 	if err != nil {
 		return err
 	}
-	s, err := a.open(t, out, policy)
+	s, err := acpc.OpenExisting(t, a.options(out, policy))
 	if err != nil {
 		return a.fail(1, err)
 	}
-	defer s.close()
-	defer out.end()
-	if !acphost.Alive(t.dir) {
-		s.catchUp()
+	defer s.Close()
+	defer out.End()
+	if !acphost.Alive(t.Dir) {
+		s.CatchUp()
 		say(a.stderr, "acpc: the host is not running (the next prompt starts it)")
 		return nil
 	}
-	if err := s.connect(); err != nil {
-		return exit(s.report(err))
+	if err := s.Connect(); err != nil {
+		return exit(a.report(t.Dir, err))
 	}
-	s.catchUp()
-	if !s.welcome.Busy {
+	s.CatchUp()
+	if !s.Busy() {
 		return nil
 	}
 	// A signal here ends attach, not the turn: cancel does that.
-	return exit(s.turnStatus(s.awaitTurn()))
+	stop, err := s.AwaitTurn()
+	return exit(a.turnStatus(t.Dir, stop, err))
 }
 
 func (a *app) cmdCancel(_ context.Context, cmd *cli.Command) error {
 	if cmd.NArg() > 0 || len(a.rest) > 0 {
 		return errors.New("cancel takes no arguments")
 	}
-	t, err := resolve(cmd.String("session"), cmd.String("dir"), defaultSession)
+	t, err := acpc.Resolve(cmd.String("session"), cmd.String("dir"), acpc.DefaultSession)
 	if err != nil {
 		return err
 	}
-	if _, err := readSessionSpec(t); err != nil {
+	if _, err := acpc.ReadSessionSpec(t); err != nil {
 		return a.fail(1, err)
 	}
 	if cmd.Bool("queued") {
-		if n := clearQueue(t.dir); n > 0 {
+		if n := acpc.ClearQueue(t.Dir); n > 0 {
 			sayf(a.stderr, "acpc: dropped %d queued prompt(s)\n", n)
 		}
 	}
 	// Queued prompts wait for the client lock. cancel takes a place at the
 	// front of the queue first, so none of them starts a turn between the
 	// interrupted client letting go and cancel connecting.
-	front, err := enqueueFront(t.dir)
+	front, err := acpc.EnqueueFront(t.Dir)
 	if err != nil {
 		return a.fail(1, err)
 	}
-	defer front.done()
+	defer front.Done()
 	// A client using the session owns the connection: a second one would
 	// replace it. Interrupting it makes a prompt cancel its turn and wait
 	// for the agent to end it, and an attach let go.
 	interrupted := false
-	if pid, held := lockHolder(t.dir); held {
-		if err := interruptClient(t, pid); err != nil {
+	if pid, held := acpc.LockHolder(t.Dir); held {
+		if err := acpc.InterruptClient(t, pid); err != nil {
 			return a.fail(1, err)
 		}
-		<-lockReleased(t.dir)
+		<-acpc.LockReleased(t.Dir)
 		interrupted = true
 	}
-	s, err := a.open(t, nil, denyAll)
+	s, err := acpc.OpenExisting(t, a.options(nil, acpc.DenyAll))
 	if err != nil {
 		return a.fail(1, err)
 	}
-	defer s.close()
+	defer s.Close()
 	busy := false
-	if acphost.Alive(t.dir) {
-		if err := s.connect(); err != nil {
-			return exit(s.report(err))
+	if acphost.Alive(t.Dir) {
+		if err := s.Connect(); err != nil {
+			return exit(a.report(t.Dir, err))
 		}
-		busy = s.welcome.Busy
+		busy = s.Busy()
 	}
 	if !busy {
 		if !interrupted {
@@ -591,52 +525,13 @@ func (a *app) cmdCancel(_ context.Context, cmd *cli.Command) error {
 		}
 		return nil
 	}
-	if err := s.cancelTurn(); err != nil {
-		return exit(s.report(err))
+	if err := s.CancelTurn(); err != nil {
+		return exit(a.report(t.Dir, err))
 	}
-	if _, err := s.awaitTurn(); err != nil {
-		return exit(s.report(err))
+	if _, err := s.AwaitTurn(); err != nil {
+		return exit(a.report(t.Dir, err))
 	}
 	return nil
-}
-
-// interruptClient sends SIGINT to the client holding t's lock. The pid
-// comes from a file, so it is only signalled if that process has the lock
-// file open, and through a pidfd so the check and the signal are about the
-// same process.
-func interruptClient(t target, pid int) error {
-	if pid <= 0 {
-		return fmt.Errorf("%s is in use; try again", t)
-	}
-	fd, err := unix.PidfdOpen(pid, 0)
-	if err != nil {
-		return fmt.Errorf("%s is in use by pid %d: %w", t, pid, err)
-	}
-	defer func() { _ = unix.Close(fd) }()
-	// /proc shows resolved paths.
-	lock, err := filepath.EvalSymlinks(filepath.Join(t.dir, lockFile))
-	if err != nil {
-		return err
-	}
-	if !hasOpen(pid, lock) {
-		return fmt.Errorf("%s is in use, but pid %d is not its client; try again", t, pid)
-	}
-	return unix.PidfdSendSignal(fd, unix.SIGINT, nil, 0)
-}
-
-// hasOpen reports whether process pid has path open.
-func hasOpen(pid int, path string) bool {
-	fds := fmt.Sprintf("/proc/%d/fd", pid)
-	ents, err := os.ReadDir(fds)
-	if err != nil {
-		return false
-	}
-	for _, e := range ents {
-		if p, err := os.Readlink(filepath.Join(fds, e.Name())); err == nil && p == path {
-			return true
-		}
-	}
-	return false
 }
 
 // listed is one session in ls.
@@ -656,7 +551,7 @@ func (a *app) cmdLs(_ context.Context, cmd *cli.Command) error {
 	if format != formatText && format != formatJSON {
 		return fmt.Errorf("--format %q: want text or json", format)
 	}
-	root, err := sessionsRoot()
+	root, err := acpc.SessionsRoot()
 	if err != nil {
 		return a.fail(1, err)
 	}
@@ -664,7 +559,7 @@ func (a *app) cmdLs(_ context.Context, cmd *cli.Command) error {
 	if err != nil {
 		return a.fail(1, err)
 	}
-	keys := []string{cwdKey(cwd)}
+	keys := []string{acpc.CwdKey(cwd)}
 	all := cmd.Bool("all")
 	if all {
 		keys = dirNames(root)
@@ -681,7 +576,7 @@ func (a *app) cmdLs(_ context.Context, cmd *cli.Command) error {
 			if d, err := proc.Open(dir); err == nil && d.Running() {
 				l.State, l.HostPid = "running", d.Pid
 			}
-			l.ClientPid, _ = lockHolder(dir)
+			l.ClientPid, _ = acpc.LockHolder(dir)
 			if seq, at := acphost.JournalTail(dir); seq > 0 {
 				l.Last = &at
 			}
@@ -733,21 +628,15 @@ func (a *app) cmdRm(_ context.Context, cmd *cli.Command) error {
 	if name == "" || cmd.NArg() > 0 || len(a.rest) > 0 {
 		return errors.New("rm needs -s NAME and no arguments")
 	}
-	t, err := resolve(name, "", "")
+	t, err := acpc.Resolve(name, "", "")
 	if err != nil {
 		return err
 	}
-	if _, err := os.Stat(t.dir); err != nil {
+	if _, err := os.Stat(t.Dir); err != nil {
 		return a.fail(1, fmt.Errorf("no %s", t))
 	}
-	unlock, err := lockClient(t)
-	if err != nil {
+	if err := acpc.Remove(t); err != nil {
 		return a.fail(1, err)
 	}
-	defer unlock()
-	if err := stopHost(t.dir); err != nil {
-		return a.fail(1, err)
-	}
-	removeNamed(t)
 	return nil
 }

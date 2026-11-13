@@ -114,7 +114,7 @@ status and stdout are the same on 50. The other five are `-h`, `--help`
 and `help`, which now print help and exit 0 instead of printing usage and
 exiting 2. Error text on stderr differs: one line, without the flag dump.
 
-What had to be worked around, in `app.go`:
+What had to be worked around, in `cmd/acpc/app.go`:
 
 - urfave drops the first `--`, and `run sh -c x` and `run echo a -- b`
   have to keep working. The arguments are split at the first `--` before

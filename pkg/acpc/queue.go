@@ -1,4 +1,4 @@
-package main
+package acpc
 
 import (
 	"encoding/json"
@@ -24,27 +24,28 @@ import (
 
 const (
 	queueDir = "queue"
-	queueLog = "queue.log" // stderr of detached waiters
+	// QueueLog gets the output of detached waiters.
+	QueueLog = "queue.log"
 	// queuePoll is how often a waiter looks at the queue and the lock.
 	queuePoll = 200 * time.Millisecond
 )
 
-// queued is what a queue file holds.
-type queued struct {
-	Input  promptInput `json:"input"`
+// Queued is what a queue file holds.
+type Queued struct {
+	Input  PromptInput `json:"input"`
 	Config *Config     `json:"config,omitempty"` // -c and isolation flags, applied when it runs
 	Policy string      `json:"policy"`
 	NoWait bool        `json:"no_wait,omitempty"`
 }
 
-// entry is this process's file in the queue, locked while it waits.
-type entry struct {
-	path string
-	f    *os.File
+// Entry is this process's file in the queue, locked while it waits.
+type Entry struct {
+	Path string
+	File *os.File
 }
 
-// enqueue adds q to the queue of the session in dir.
-func enqueue(dir string, q queued) (*entry, error) {
+// Enqueue adds q to the queue of the session in dir.
+func Enqueue(dir string, q Queued) (*Entry, error) {
 	qd := filepath.Join(dir, queueDir)
 	if err := os.MkdirAll(qd, 0o700); err != nil {
 		return nil, err
@@ -76,12 +77,12 @@ func enqueue(dir string, q queued) (*entry, error) {
 		_ = os.Remove(tmp)
 		return nil, err
 	}
-	return &entry{path: path, f: f}, nil
+	return &Entry{Path: path, File: f}, nil
 }
 
-// enqueueFront adds an entry that sorts before every waiting prompt, for
+// EnqueueFront adds an entry that sorts before every waiting prompt, for
 // a command that needs the session next without sending a prompt.
-func enqueueFront(dir string) (*entry, error) {
+func EnqueueFront(dir string) (*Entry, error) {
 	qd := filepath.Join(dir, queueDir)
 	if err := os.MkdirAll(qd, 0o700); err != nil {
 		return nil, err
@@ -95,12 +96,12 @@ func enqueueFront(dir string) (*entry, error) {
 		_ = f.Close()
 		return nil, err
 	}
-	return &entry{path: path, f: f}, nil
+	return &Entry{Path: path, File: f}, nil
 }
 
-// adopt takes over an entry whose lock this process inherited as fd.
-func adopt(path string, fd uintptr) (*entry, queued, error) {
-	var q queued
+// Adopt takes over an entry whose lock this process inherited as fd.
+func Adopt(path string, fd uintptr) (*Entry, Queued, error) {
+	var q Queued
 	f := os.NewFile(fd, path)
 	if f == nil {
 		return nil, q, fmt.Errorf("queue entry %s: no lock fd", path)
@@ -114,18 +115,18 @@ func adopt(path string, fd uintptr) (*entry, queued, error) {
 		_ = f.Close()
 		return nil, q, fmt.Errorf("queue entry %s: %w", path, err)
 	}
-	return &entry{path: path, f: f}, q, nil
+	return &Entry{Path: path, File: f}, q, nil
 }
 
-// done removes the entry and lets go of its lock.
-func (e *entry) done() {
-	_ = os.Remove(e.path)
-	_ = e.f.Close()
+// Done removes the entry and lets go of its lock.
+func (e *Entry) Done() {
+	_ = os.Remove(e.Path)
+	_ = e.File.Close()
 }
 
-// queueAhead returns the live entries in dir's queue that come before
+// QueueAhead returns the live entries in dir's queue that come before
 // name (all of them for ""), removing the files of dead waiters.
-func queueAhead(dir, name string) []string {
+func QueueAhead(dir, name string) []string {
 	qd := filepath.Join(dir, queueDir)
 	ents, _ := os.ReadDir(qd)
 	var live []string
@@ -156,23 +157,23 @@ func held(path string) bool {
 	return errors.Is(unix.Flock(int(f.Fd()), unix.LOCK_SH|unix.LOCK_NB), unix.EWOULDBLOCK)
 }
 
-// errDropped is a queued prompt whose file was removed: cancel --queued
+// ErrDropped is a queued prompt whose file was removed: cancel --queued
 // or rm.
-var errDropped = errors.New("the prompt was removed from the queue")
+var ErrDropped = errors.New("the prompt was removed from the queue")
 
 // waitTurn waits until e is first in the queue and the client lock is
 // free, and returns holding the lock. A turn may still be running; the
 // caller waits for it with the connection. A signal ends the wait with
-// errInterrupted.
-func waitTurn(t target, e *entry, sigs <-chan os.Signal) (unlock func(), err error) {
-	name := filepath.Base(e.path)
+// ErrInterrupted.
+func waitTurn(t Target, e *Entry, sigs <-chan os.Signal) (unlock func(), err error) {
+	name := filepath.Base(e.Path)
 	for {
-		if _, err := os.Stat(e.path); err != nil {
-			return nil, errDropped
+		if _, err := os.Stat(e.Path); err != nil {
+			return nil, ErrDropped
 		}
-		if len(queueAhead(t.dir, name)) == 0 {
-			unlock, err := lockClient(t)
-			var inUse *inUseError
+		if len(QueueAhead(t.Dir, name)) == 0 {
+			unlock, err := LockClient(t)
+			var inUse *InUseError
 			if err == nil {
 				return unlock, nil
 			}
@@ -182,28 +183,25 @@ func waitTurn(t target, e *entry, sigs <-chan os.Signal) (unlock func(), err err
 		}
 		select {
 		case <-sigs:
-			return nil, errInterrupted
+			return nil, ErrInterrupted
 		case <-time.After(queuePoll):
 		}
 	}
 }
 
-// startWaiter starts a detached acpc that waits for e and sends its prompt
-// with --no-wait semantics. It inherits e's lock, so e stays live after
-// this process exits.
-func startWaiter(t target, e *entry) error {
-	exe, err := os.Executable()
-	if err != nil {
-		return err
-	}
-	logf, err := os.OpenFile(filepath.Join(t.dir, queueLog), os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
+// StartWaiter starts the detached process argv that waits for e and sends
+// its prompt, with stdout and stderr appended to QueueLog. It gets e's lock
+// as fd QueuedFD, so e stays live after this process exits; it calls Adopt
+// to take e over.
+func StartWaiter(t Target, e *Entry, argv []string) error {
+	logf, err := os.OpenFile(filepath.Join(t.Dir, QueueLog), os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
 	if err != nil {
 		return err
 	}
 	defer func() { _ = logf.Close() }()
-	cmd := exec.Command(exe, "prompt", "--dir", t.dir, "--queued", e.path)
+	cmd := exec.Command(argv[0], argv[1:]...)
 	cmd.Stdout, cmd.Stderr = logf, logf
-	cmd.ExtraFiles = []*os.File{e.f} // fd 3
+	cmd.ExtraFiles = []*os.File{e.File} // fd 3
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
 	if err := cmd.Start(); err != nil {
 		return err
@@ -211,13 +209,13 @@ func startWaiter(t target, e *entry) error {
 	return cmd.Process.Release()
 }
 
-// queuedFD is the fd a detached waiter gets its entry's lock on.
-const queuedFD = 3
+// QueuedFD is the fd a detached waiter gets its entry's lock on.
+const QueuedFD = 3
 
-// clearQueue removes the waiting prompts of the session in dir and
+// ClearQueue removes the waiting prompts of the session in dir and
 // returns how many there were. Their waiters see the file gone and exit.
-func clearQueue(dir string) int {
-	names := queueAhead(dir, "")
+func ClearQueue(dir string) int {
+	names := QueueAhead(dir, "")
 	for _, n := range names {
 		_ = os.Remove(filepath.Join(dir, queueDir, n))
 	}

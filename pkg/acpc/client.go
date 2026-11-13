@@ -1,4 +1,8 @@
-package main
+// Package acpc is an ACP client for sessions kept by acphost hosts: a
+// session directory per conversation, one client at a time under a lock,
+// a queue of waiting prompts, and what the agent did shown from the host's
+// journal. cmd/acpc is the command line on top of it.
+package acpc
 
 import (
 	"bytes"
@@ -24,15 +28,15 @@ import (
 // exactly what it has shown. A message on the socket only says that the
 // journal has grown.
 
-// errInterrupted is a signal that ends the command: one outside a turn,
+// ErrInterrupted is a signal that ends the command: one outside a turn,
 // or a second one while a turn is being cancelled.
-var errInterrupted = errors.New("interrupted")
+var ErrInterrupted = errors.New("interrupted")
 
 // Permission policies.
 const (
-	approveAll   = "approve-all"
-	approveReads = "approve-reads"
-	denyAll      = "deny-all"
+	ApproveAll   = "approve-all"
+	ApproveReads = "approve-reads"
+	DenyAll      = "deny-all"
 )
 
 // link is a connection to a session's host.
@@ -50,8 +54,8 @@ type link struct {
 
 // dial connects to the session's host and serves the agent's messages
 // until the connection ends.
-func (s *session) dial() (*link, acphost.Welcome, error) {
-	nc, rd, w, err := acphost.Connect(context.Background(), s.t.dir, acphost.WithMethodPrefix(s.spec.MethodPrefix))
+func (s *Session) dial() (*link, acphost.Welcome, error) {
+	nc, rd, w, err := acphost.Connect(context.Background(), s.t.Dir, acphost.WithMethodPrefix(s.spec.MethodPrefix))
 	if err != nil {
 		return nil, w, err
 	}
@@ -97,7 +101,7 @@ func (l *link) close() {
 // requests are served; the client offers no file, terminal or elicitation
 // capability, so the agent does that work itself, inside its sandbox.
 type agentRequests struct {
-	s *session
+	s *Session
 	l *link
 }
 
@@ -149,19 +153,19 @@ func (r *agentRequests) WaitForTerminalExit(context.Context, acp.WaitForTerminal
 
 // tracef writes a step of the ACP handshake when the session traces them.
 // Steps are written as they happen, before the frames they cause.
-func (s *session) tracef(format string, args ...any) {
-	if s.trace && s.out != nil {
-		sayf(s.out.w, format+"\n", args...)
+func (s *Session) tracef(format string, args ...any) {
+	if s.opts.Trace != nil {
+		_, _ = fmt.Fprintf(s.opts.Trace, format+"\n", args...)
 	}
 }
 
-func (s *session) journal() string { return filepath.Join(s.t.dir, acphost.JournalFile) }
+func (s *Session) journal() string { return filepath.Join(s.t.Dir, acphost.JournalFile) }
 
-// catchUp shows the journal frames after the last one this client showed
+// CatchUp shows the journal frames after the last one this client showed
 // and leaves the cursor at the journal's end. Without an output the
 // journal is left unread, so a later attach still shows it.
-func (s *session) catchUp() {
-	if s.out == nil {
+func (s *Session) CatchUp() {
+	if s.opts.Output == nil {
 		return
 	}
 	frames, off, err := acphost.ReadJournal(s.journal(), s.state.Seq)
@@ -173,8 +177,8 @@ func (s *session) catchUp() {
 }
 
 // show renders what the journal gained since the last call.
-func (s *session) show() {
-	if s.out == nil {
+func (s *Session) show() {
+	if s.opts.Output == nil {
 		return
 	}
 	frames, off, err := acphost.ReadFrom(s.journal(), s.off)
@@ -185,13 +189,13 @@ func (s *session) show() {
 	s.render(frames)
 }
 
-func (s *session) render(frames []acphost.Frame) {
+func (s *Session) render(frames []acphost.Frame) {
 	for _, fr := range frames {
 		if fr.Seq <= s.state.Seq {
 			continue
 		}
 		if !s.muted {
-			s.out.frame(fr)
+			s.opts.Output.Frame(fr)
 		}
 		s.state.Seq = fr.Seq
 	}
@@ -200,7 +204,7 @@ func (s *session) render(frames []acphost.Frame) {
 // wait runs fn, which talks to the agent, and shows the journal as the
 // host's messages arrive until fn returns or done has a value. A signal
 // cancels the running turn.
-func (s *session) wait(fn func(context.Context) error, done <-chan struct{}) error {
+func (s *Session) wait(fn func(context.Context) error, done <-chan struct{}) error {
 	result := make(chan error, 1)
 	if fn != nil {
 		go func() { result <- fn(context.Background()) }()
@@ -235,18 +239,18 @@ func (s *session) wait(fn func(context.Context) error, done <-chan struct{}) err
 	}
 }
 
-// hostGone is a host that stopped while this client was connected.
-type hostGone struct{ exit acphost.Exit }
+// HostGoneError is a host that stopped while this client was connected.
+type HostGoneError struct{ Exit acphost.Exit }
 
-func (e *hostGone) Error() string {
-	s := "the host stopped: " + e.exit.Reason
+func (e *HostGoneError) Error() string {
+	s := "the host stopped: " + e.Exit.Reason
 	switch {
-	case e.exit.Error != "":
-		s += ": " + e.exit.Error
-	case e.exit.Signal != "":
-		s += " (agent killed by " + e.exit.Signal + ")"
-	case e.exit.Reason == "agent exited":
-		s += fmt.Sprintf(" (status %d)", e.exit.ExitCode)
+	case e.Exit.Error != "":
+		s += ": " + e.Exit.Error
+	case e.Exit.Signal != "":
+		s += " (agent killed by " + e.Exit.Signal + ")"
+	case e.Exit.Reason == "agent exited":
+		s += fmt.Sprintf(" (status %d)", e.Exit.ExitCode)
 	}
 	return s
 }
@@ -254,25 +258,26 @@ func (e *hostGone) Error() string {
 // lost explains a closed connection. The host removes exit.json when it
 // starts and writes it before it closes its connections, so one that is
 // there is this host's.
-func (s *session) lost() error {
-	if ex, ok := acphost.ReadExit(s.t.dir); ok {
-		return &hostGone{ex}
+func (s *Session) lost() error {
+	if ex, ok := acphost.ReadExit(s.t.Dir); ok {
+		return &HostGoneError{ex}
 	}
 	return errors.New("the host closed the connection (another client connected to the session)")
 }
 
 // interrupt cancels the running turn on the first signal. The agent then
 // ends the turn itself, so the command keeps waiting for that.
-func (s *session) interrupt() error {
+func (s *Session) interrupt() error {
 	s.interrupts++
 	if !s.inTurn || s.interrupts > 1 {
-		return errInterrupted
+		return ErrInterrupted
 	}
-	say(s.a.stderr, "acpc: cancelling the turn (interrupt again to stop waiting)")
-	return s.cancelTurn()
+	s.logln("cancelling the turn (interrupt again to stop waiting)")
+	return s.CancelTurn()
 }
 
-func (s *session) cancelTurn() error {
+// CancelTurn sends session/cancel for the running turn.
+func (s *Session) CancelTurn() error {
 	// From here on a permission request is answered as cancelled, as ACP asks.
 	s.cancelling.Store(true)
 	return s.link.conn.Cancel(context.Background(), acp.CancelNotification{SessionId: acp.SessionId(s.state.ACPSession)})
@@ -280,7 +285,7 @@ func (s *session) cancelTurn() error {
 
 // permit picks the option the policy allows: an allow or a reject option,
 // the one-time kind first so nothing outlasts the request.
-func (s *session) permit(p acp.RequestPermissionRequest) acp.RequestPermissionOutcome {
+func (s *Session) permit(p acp.RequestPermissionRequest) acp.RequestPermissionOutcome {
 	if s.cancelling.Load() {
 		return acp.NewRequestPermissionOutcomeCancelled()
 	}
@@ -288,7 +293,7 @@ func (s *session) permit(p acp.RequestPermissionRequest) acp.RequestPermissionOu
 	if p.ToolCall.Kind != nil {
 		kind = *p.ToolCall.Kind
 	}
-	allow := s.policy == approveAll || (s.policy == approveReads && (kind == acp.ToolKindRead || kind == acp.ToolKindSearch))
+	allow := s.opts.Policy == ApproveAll || (s.opts.Policy == ApproveReads && (kind == acp.ToolKindRead || kind == acp.ToolKindSearch))
 	want := []acp.PermissionOptionKind{acp.PermissionOptionKindRejectOnce, acp.PermissionOptionKindRejectAlways}
 	if allow {
 		want = []acp.PermissionOptionKind{acp.PermissionOptionKindAllowOnce, acp.PermissionOptionKindAllowAlways}
@@ -301,7 +306,7 @@ func (s *session) permit(p acp.RequestPermissionRequest) acp.RequestPermissionOu
 		if shown == "" {
 			shown = "kind not given"
 		}
-		sayf(s.a.stderr, "acpc: refused permission: %s (%s); --approve-all allows it\n", what, shown)
+		s.logf("refused permission: %s (%s)\n", what, shown)
 	}
 	for _, k := range want {
 		for _, o := range p.Options {
@@ -318,7 +323,7 @@ func (s *session) permit(p acp.RequestPermissionRequest) acp.RequestPermissionOu
 // was last opened runs a new agent, which has to load the session again.
 // If it cannot, the conversation starts over and ensure returns a summary
 // of the journal to put in front of the next prompt.
-func (s *session) ensure() (seed string, err error) {
+func (s *Session) ensure() (seed string, err error) {
 	// What the agent sends here (a load replays the whole conversation)
 	// is not new to the user.
 	s.muted = true
@@ -338,7 +343,7 @@ func (s *session) ensure() (seed string, err error) {
 			var err error
 			init, err = s.link.conn.Initialize(ctx, acp.InitializeRequest{
 				ProtocolVersion: acp.ProtocolVersion(acp.ProtocolVersionNumber),
-				ClientInfo:      &acp.Implementation{Name: "acpc", Version: version()},
+				ClientInfo:      &s.opts.ClientInfo,
 			})
 			return err
 		}, nil)
@@ -379,16 +384,16 @@ func (s *session) ensure() (seed string, err error) {
 		if !errors.As(err, &refused) {
 			return "", err
 		}
-		say(s.a.stderr, "acpc: session/load:", err)
+		s.logln("session/load:", err)
 	}
 	// As jobshop does: a failed load would fail again on every restart.
 	frames, _, _ := acphost.ReadJournal(s.journal(), 0)
 	seed = acphost.Summarize(frames, 0)
-	say(s.a.stderr, "acpc: the agent could not reload the conversation; starting a new one from a summary of the journal")
+	s.logln("the agent could not reload the conversation; starting a new one from a summary of the journal")
 	return seed, s.newSession()
 }
 
-func (s *session) newSession() error {
+func (s *Session) newSession() error {
 	s.tracef("[client] session/new cwd %s (running)", s.spec.Dir)
 	var res acp.NewSessionResponse
 	err := s.wait(func(ctx context.Context) error {
@@ -408,24 +413,24 @@ func (s *session) newSession() error {
 
 // opened records that the agent process behind this host has the ACP
 // session id open. Saved now: a later failure must not lose it.
-func (s *session) opened(id string) error {
+func (s *Session) opened(id string) error {
 	s.state.ACPSession, s.state.HostPid = id, s.welcome.Pid
-	return writeState(s.t.dir, s.state)
+	return writeState(s.t.Dir, s.state)
 }
 
 // promptRequest is the session/prompt for in.
-func (s *session) promptRequest(in promptInput) (acp.PromptRequest, error) {
-	blocks, err := contentBlocks(in, s.caps)
+func (s *Session) promptRequest(in PromptInput) (acp.PromptRequest, error) {
+	blocks, err := ContentBlocks(in, s.caps)
 	if err != nil {
 		return acp.PromptRequest{}, err
 	}
 	return acp.PromptRequest{SessionId: acp.SessionId(s.state.ACPSession), Prompt: blocks}, nil
 }
 
-// awaitTurn waits for a turn another connection started. The host reports
+// AwaitTurn waits for a turn another connection started. The host reports
 // its end with the turn_end extension method. A signal ends the wait and
 // leaves the turn running.
-func (s *session) awaitTurn() (acp.StopReason, error) {
+func (s *Session) AwaitTurn() (acp.StopReason, error) {
 	ended := make(chan struct{})
 	var te acphost.TurnEnd
 	go func() {
@@ -450,51 +455,11 @@ func (s *session) awaitTurn() (acp.StopReason, error) {
 	return r.StopReason, nil
 }
 
-// turnStatus is the exit status for a finished turn: 0 for end_turn, 130
-// for a cancelled one, 1 for any other stop reason or an error.
-func (s *session) turnStatus(stop acp.StopReason, err error) int {
-	if err != nil {
-		return s.report(err)
-	}
-	switch stop {
-	case acp.StopReasonEndTurn:
-		return 0
-	case acp.StopReasonCancelled:
-		return 130
-	}
-	say(s.a.stderr, "acpc: the turn stopped:", stop)
-	return 1
-}
+// SpawnError is a host that could not be started: exit 125.
+type SpawnError struct{ err error }
 
-// report prints err and returns the exit status for it. For a host that
-// stopped it adds the end of the host's log, where the agent's stderr is.
-func (s *session) report(err error) int {
-	if errors.Is(err, errInterrupted) {
-		return 130
-	}
-	say(s.a.stderr, "acpc:", err)
-	var gone *hostGone
-	if errors.As(err, &gone) {
-		if tail := hostLogTail(s.t.dir); tail != "" {
-			sayf(s.a.stderr, "acpc: end of %s:\n%s\n", filepath.Join(s.t.dir, acphost.LogFile), tail)
-		}
-		// bwrap reports a command it cannot run after the host is up.
-		if gone.exit.Reason == acphost.ReasonSpawnFailed {
-			return 125
-		}
-	}
-	var spawn *spawnError
-	if errors.As(err, &spawn) {
-		return 125
-	}
-	return 1
-}
-
-// spawnError is a host that could not be started: exit 125.
-type spawnError struct{ err error }
-
-func (e *spawnError) Error() string { return e.err.Error() }
-func (e *spawnError) Unwrap() error { return e.err }
+func (e *SpawnError) Error() string { return e.err.Error() }
+func (e *SpawnError) Unwrap() error { return e.err }
 
 // frameMethod is the JSON-RPC method of a journal frame.
 func frameMethod(fr acphost.Frame) string {
@@ -505,8 +470,8 @@ func frameMethod(fr acphost.Frame) string {
 	return m.Method
 }
 
-// hostLogTail is the last lines of the host's log.
-func hostLogTail(dir string) string {
+// HostLogTail is the last lines of the host's log.
+func HostLogTail(dir string) string {
 	b, err := os.ReadFile(filepath.Join(dir, acphost.LogFile))
 	if err != nil {
 		return ""

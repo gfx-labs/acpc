@@ -11,7 +11,7 @@ spoken with [go-acp](https://github.com/gfx-labs/go-acp).
 Linux only.
 
 ```sh
-go install github.com/gfx-labs/acpc@latest
+go install github.com/gfx-labs/acpc/cmd/acpc@latest
 ```
 
 ## Use
@@ -59,16 +59,32 @@ acpc rm -s work
 - If the host stopped, the next `prompt` starts it and the agent loads
   the conversation (`session/load`), or gets a summary of the journal if
   it cannot.
+- A prompt for a session in use waits its turn: prompts run one after
+  another in the order they came. With `--no-wait` a detached acpc waits
+  for it, logging to `queue.log` in the session directory.
+  `cancel --queued` also drops the waiting prompts.
+- `-f FILE` (repeatable) sends a file with the prompt: an image as an
+  image block, another file embedded in the prompt, or as a link to the
+  file when the agent does not take embedded context. An agent that does
+  not take images refuses one.
 - Exit status: 0 `end_turn`, 130 cancelled, 1 another stop reason or an
   error, 125 the agent could not start, 2 a bad command line.
 
-Details: [docs/notes/290-cli-sessions.md](docs/notes/290-cli-sessions.md).
+Details: [docs/notes/290-cli-sessions.md](docs/notes/290-cli-sessions.md),
+[docs/notes/2026-11-13-prompt-queue.md](docs/notes/2026-11-13-prompt-queue.md).
+
+## Library
+
+`pkg/acpc` is the client without the command line: `acpc.Open` takes a
+session's lock, and `Session` creates it (`Create`), runs turns
+(`Prompt`, `Submit`), follows another client's turn (`AwaitTurn`) and
+cancels one. Output goes to an `acpc.Output` that gets journal frames.
 
 ## Not done
 
 - The agent's `fs/*` and `terminal/*` client methods. The agent does its
   file and command work itself, inside its sandbox.
-- MCP server config, queued prompts, images or files in a prompt.
+- MCP server config.
 
 ## Check
 

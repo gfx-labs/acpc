@@ -10,6 +10,8 @@ import (
 	"strconv"
 	"time"
 
+	"github.com/gfx-labs/acpc/pkg/acpc"
+
 	"github.com/urfave/cli/v3"
 )
 
@@ -210,7 +212,7 @@ func sessionFlags() []cli.Flag {
 
 // graceFlag is stop's --grace.
 func graceFlag() cli.Flag {
-	return &cli.DurationFlag{Name: "grace", Value: stopGrace, Usage: "SIGKILL the host if it still runs after this long (0 waits)"}
+	return &cli.DurationFlag{Name: "grace", Value: acpc.StopGrace, Usage: "SIGKILL the host if it still runs after this long (0 waits)"}
 }
 
 // turnFlags are how a turn is shown and how permission requests are answered.
