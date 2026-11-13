@@ -1,0 +1,44 @@
+name: release
+
+# release-please keeps one release PR open with the next 0.x version and
+# CHANGELOG. Ordinary merges only update it; merging the release
+# PR tags the release, which is the Go module version.
+on:
+  push:
+    branches: [master]
+
+permissions:
+  contents: read
+
+jobs:
+  release-please:
+    runs-on: ubicloud
+    steps:
+      # An App token, not GITHUB_TOKEN: a PR opened with GITHUB_TOKEN gets
+      # no CI runs, so the required checks never report on the release PR.
+      - uses: actions/create-github-app-token@v2
+        id: app
+        with:
+          app-id: ${{ secrets.RELEASE_APP_ID }}
+          private-key: ${{ secrets.RELEASE_APP_KEY }}
+      - uses: googleapis/release-please-action@v4
+        id: rp
+        with:
+          token: ${{ steps.app.outputs.token }}
+          config-file: release-please-config.json
+          manifest-file: .release-please-manifest.json
+      # Hand-written release notes live in docs/notes/<date>-release-vX.Y.Z.md.
+      # Append a link to the matching note, if any, to the release.
+      - uses: actions/checkout@v5
+        if: steps.rp.outputs.release_created
+      - name: link release notes
+        if: steps.rp.outputs.release_created
+        env:
+          GH_TOKEN: ${{ steps.app.outputs.token }}
+          TAG: ${{ steps.rp.outputs.tag_name }}
+        run: |
+          note=$(ls docs/notes/*-release-"$TAG".md 2>/dev/null | head -1)
+          [ -n "$note" ] || exit 0
+          body=$(gh release view "$TAG" --json body -q .body)
+          printf '%s\n\nRelease notes: %s/%s/blob/%s/%s\n' "$body" "$GITHUB_SERVER_URL" "$GITHUB_REPOSITORY" "$TAG" "$note" |
+            gh release edit "$TAG" --notes-file -

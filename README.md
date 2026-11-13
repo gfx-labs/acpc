@@ -91,3 +91,8 @@ cancels one. Output goes to an `acpc.Output` that gets journal frames.
 ```sh
 go build ./... && go vet ./... && go test ./... && golangci-lint run ./...
 ```
+
+## Releases
+
+Master is squash-only and PR titles are conventional commits.
+release-please keeps a release PR open; merging it tags `vX.Y.Z`.
