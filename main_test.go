@@ -1,39 +1,20 @@
 package main
 
 import (
-	"bytes"
-	"context"
-	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
-	"strings"
 	"testing"
 
 	"github.com/gfx-labs/acphost/pkg/acphost"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	"github.com/urfave/cli/v3"
 )
 
 func TestMain(m *testing.M) {
 	acphost.MaybeChild()
 	maybeFakeAgent()
 	os.Exit(m.Run())
-}
-
-// parse runs a run, host or start command line as far as its flags and
-// returns the opts the command would act on.
-func parse(args []string, stderr io.Writer) (opts, error) {
-	a := newApp(nil, io.Discard, stderr)
-	var o opts
-	for _, c := range a.root.Commands {
-		c.Action = func(_ context.Context, cmd *cli.Command) (err error) {
-			o, err = a.opts(cmd)
-			return err
-		}
-	}
-	return o, a.exec(args)
 }
 
 func TestParseConfig(t *testing.T) {
@@ -60,35 +41,6 @@ env: [A=b]
 	}
 }
 
-func TestBuildOverrides(t *testing.T) {
-	o, err := parse([]string{"run", "--network", "none", "--ro", "/a:/b", "--rw", "/w", "--join", "net=/proc/1/ns/net", "--", "true"}, &bytes.Buffer{})
-	require.NoError(t, err)
-	s, err := build(o, nil)
-	require.NoError(t, err)
-	assert.Equal(t, "none", s.Sandbox.Network)
-	assert.Equal(t, "/b", s.Sandbox.RO[0].Dst)
-	assert.Equal(t, "/w", s.Sandbox.RW[0].Src)
-	assert.Equal(t, "/proc/1/ns/net", s.Join["net"])
-	assert.Equal(t, []string{"true"}, append([]string{s.Command}, s.Args...))
-}
-
-func TestRunExitCodeNoIsolation(t *testing.T) {
-	var out bytes.Buffer
-	code := run([]string{"run", "--dir", t.TempDir(), "--", "sh", "-c", "echo hi; exit 3"}, nil, &out, &bytes.Buffer{})
-	assert.Equal(t, 3, code)
-	assert.Equal(t, "hi\n", out.String())
-}
-
-// buildCLI builds the binary, so the e2e run goes through a real main
-// and its helper re-execs.
-func buildCLI(t *testing.T) string {
-	t.Helper()
-	bin := filepath.Join(t.TempDir(), "acphost")
-	out, err := exec.Command("go", "build", "-o", bin, ".").CombinedOutput()
-	require.NoError(t, err, string(out))
-	return bin
-}
-
 func needBwrap(t *testing.T) {
 	t.Helper()
 	p, err := exec.LookPath("bwrap")
@@ -100,36 +52,11 @@ func needBwrap(t *testing.T) {
 	}
 }
 
-func TestE2ERunSandbox(t *testing.T) {
-	needBwrap(t)
-	bin := buildCLI(t)
-	work := t.TempDir()
-	secret := t.TempDir()
-	require.NoError(t, os.WriteFile(filepath.Join(secret, "key"), []byte("x"), 0o600))
-	ro := ""
-	for _, p := range []string{"/nix", "/bin", "/usr", "/lib", "/lib64", "/etc"} {
-		ro += "    - {src: " + p + ", skip_missing: true}\n"
-	}
-	cfg := "sandbox:\n  ro:\n" + ro + "    - " + secret + "\n  rw: [" + work + "]\n  hide: [" + secret + "]\n  network: none\n  env_keep: [PATH]\n"
-	script := `test -e ` + secret + `/key && echo visible; touch /etc/x 2>/dev/null && echo writable; ` +
-		`touch ok; cat /sys/class/net/*/operstate 2>/dev/null | wc -l; exit 5`
-	cmd := exec.Command(bin, "run", "-c", "-", "--dir", work, "--", "sh", "-c", script)
-	cmd.Stdin = strings.NewReader(cfg)
-	var stdout, stderr bytes.Buffer
-	cmd.Stdout, cmd.Stderr = &stdout, &stderr
-	err := cmd.Run()
-	var ee *exec.ExitError
-	require.ErrorAs(t, err, &ee, stderr.String())
-	assert.Equal(t, 5, ee.ExitCode(), stderr.String())
-	assert.NotContains(t, stdout.String(), "visible", "hidden path")
-	assert.NotContains(t, stdout.String(), "writable", "read-only bind")
-	_, err = os.Stat(filepath.Join(work, "ok"))
-	assert.NoError(t, err, "rw dir")
-
-	// --print runs nothing and shows the bwrap argv.
-	cmd = exec.Command(bin, "run", "-c", "-", "--dir", work, "--print", "--", "true")
-	cmd.Stdin = strings.NewReader(cfg)
-	out, err := cmd.Output()
-	require.NoError(t, err)
-	assert.Contains(t, string(out), "--unshare-net")
+// buildCLI builds the binary, for tests that need a real process to signal.
+func buildCLI(t *testing.T) string {
+	t.Helper()
+	bin := filepath.Join(t.TempDir(), "acpc")
+	out, err := exec.Command("go", "build", "-o", bin, ".").CombinedOutput()
+	require.NoError(t, err, string(out))
+	return bin
 }

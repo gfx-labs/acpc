@@ -1,0 +1,23 @@
+version: "2"
+
+linters:
+  default: standard
+  enable:
+    - errorlint
+    - gocritic
+    - misspell
+    - revive
+    - unconvert
+  settings:
+    revive:
+      # Setting rules replaces the defaults unless this is on.
+      enable-default-rules: true
+      rules:
+        # Every exported name needs a doc comment (#4).
+        - name: exported
+        - name: package-comments
+
+formatters:
+  enable:
+    - gofumpt
+    - goimports

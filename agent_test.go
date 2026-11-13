@@ -39,7 +39,49 @@ type fakeAgent struct {
 	answers chan message  // responses to this agent's requests
 }
 
+// The fake agent speaks raw JSON-RPC with its own types, as an agent this
+// repository did not write would.
 type (
+	message struct {
+		JSONRPC string          `json:"jsonrpc"`
+		ID      json.RawMessage `json:"id,omitempty"`
+		Method  string          `json:"method,omitempty"`
+		Params  json.RawMessage `json:"params,omitempty"`
+		Result  json.RawMessage `json:"result,omitempty"`
+		Error   *rpcError       `json:"error,omitempty"`
+	}
+	rpcError struct {
+		Code    int    `json:"code"`
+		Message string `json:"message"`
+	}
+	contentText struct {
+		Type string `json:"type"`
+		Text string `json:"text"`
+	}
+	initializeResult struct {
+		ProtocolVersion   int `json:"protocolVersion"`
+		AgentCapabilities struct {
+			LoadSession bool `json:"loadSession"`
+		} `json:"agentCapabilities"`
+	}
+	sessionParams struct {
+		SessionID string `json:"sessionId"`
+	}
+	sessionResult struct {
+		SessionID string `json:"sessionId"`
+	}
+	promptParams struct {
+		Prompt []contentText `json:"prompt"`
+	}
+	promptResult struct {
+		StopReason string `json:"stopReason"`
+	}
+	permissionResult struct {
+		Outcome struct {
+			Outcome  string `json:"outcome"`
+			OptionID string `json:"optionId"`
+		} `json:"outcome"`
+	}
 	agentUpdate struct {
 		SessionID string       `json:"sessionId"`
 		Update    agentMessage `json:"update"`
@@ -104,7 +146,7 @@ func (a *fakeAgent) handle(m message) {
 		if a.mode == agentQuits {
 			os.Exit(3)
 		}
-		var res initializeResult
+		res := initializeResult{ProtocolVersion: 1}
 		res.AgentCapabilities.LoadSession = a.mode == agentLoads || a.mode == agentLoadFails
 		a.send(message{ID: m.ID, Result: rawJSON(res)})
 	case "session/new":
@@ -211,4 +253,9 @@ func maybeFakeAgent() {
 	if i := slices.Index(os.Args, fakeAgentArg); i == 1 {
 		runFakeAgent(os.Args[i+1:])
 	}
+}
+
+func rawJSON(v any) json.RawMessage {
+	b, _ := json.Marshal(v)
+	return b
 }

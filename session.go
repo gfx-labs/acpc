@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -11,16 +12,16 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync/atomic"
 
 	"github.com/gfx-labs/acphost/pkg/acphost"
 	"github.com/gfx-labs/acphost/pkg/proc"
-	"github.com/urfave/cli/v3"
 	"golang.org/x/sys/unix"
 )
 
 // A session is a host's session directory plus two files of this client:
 // client.json and client.lock. Named sessions live under
-// $XDG_STATE_HOME/acphost/sessions/<cwd key>/<name>, so a name means a
+// $XDG_STATE_HOME/acpc/sessions/<cwd key>/<name>, so a name means a
 // different session in each working directory. See
 // docs/notes/290-cli-sessions.md.
 
@@ -98,7 +99,7 @@ func sessionsRoot() (string, error) {
 		}
 		base = filepath.Join(home, ".local", "state")
 	}
-	return filepath.Join(base, "acphost", "sessions"), nil
+	return filepath.Join(base, "acpc", "sessions"), nil
 }
 
 // cwdKey names a working directory under the sessions root. It is a short
@@ -146,15 +147,6 @@ func resolve(name, dir, fallback string) (target, error) {
 		return target{}, err
 	}
 	return target{name: name, dir: filepath.Join(root, cwdKey(cwd), name)}, nil
-}
-
-// sessionRef is the session a detached command (status, stop, wait) names.
-func sessionRef(cmd *cli.Command) (target, error) {
-	t, err := resolve(cmd.String("session"), cmd.String("dir"), "")
-	if err != nil {
-		return t, fmt.Errorf("%s: %w", cmd.Name, err)
-	}
-	return t, nil
 }
 
 // inUseError is a session whose client lock another process holds.
@@ -241,10 +233,10 @@ type session struct {
 	off    int64   // journal offset read so far
 	policy string  // permission policy
 
-	muted      bool // read the journal without showing it
-	trace      bool // show the handshake steps (exec with --format text)
-	inTurn     bool // a signal cancels the turn instead of ending the command
-	cancelling bool // session/cancel was sent
+	muted      bool        // read the journal without showing it
+	trace      bool        // show the handshake steps (exec with --format text)
+	inTurn     bool        // a signal cancels the turn instead of ending the command
+	cancelling atomic.Bool // session/cancel was sent; read by permission handlers
 	interrupts int
 }
 
@@ -280,7 +272,7 @@ func (a *app) open(t target, out *output, policy string) (*session, error) {
 func readSessionSpec(t target) (acphost.Spec, error) {
 	spec, err := acphost.ReadSpec(t.dir)
 	if errors.Is(err, os.ErrNotExist) {
-		return spec, fmt.Errorf("no %s (acphost new creates one)", t)
+		return spec, fmt.Errorf("no %s (acpc new creates one)", t)
 	}
 	return spec, err
 }
@@ -292,7 +284,7 @@ func (s *session) close() {
 		s.link.close()
 	}
 	if err := writeState(s.t.dir, s.state); err != nil && !errors.Is(err, os.ErrNotExist) {
-		say(s.a.stderr, "acphost:", err)
+		say(s.a.stderr, "acpc:", err)
 	}
 	s.unlock()
 	signal.Stop(s.sigs)
@@ -307,19 +299,19 @@ func (s *session) start() error {
 	if err := acphost.CheckSpawn(s.spec, false, acphost.WithHostDir(s.t.dir)); err != nil {
 		return &spawnError{err}
 	}
-	s.tracef("[acphost] spawning agent: %s", strings.Join(append([]string{s.spec.Command}, s.spec.Args...), " "))
+	s.tracef("[acpc] spawning agent: %s", strings.Join(append([]string{s.spec.Command}, s.spec.Args...), " "))
 	d, err := acphost.StartDetached(s.t.dir, nil)
 	if err != nil {
 		return &spawnError{err}
 	}
-	s.tracef("[acphost] host pid %d", d.Pid)
+	s.tracef("[acpc] host pid %d", d.Pid)
 	return nil
 }
 
 // connect dials the host. It shows nothing yet: a command the session
 // refuses must not use up what the journal has for the next attach.
 func (s *session) connect() error {
-	l, w, err := dial(s.t.dir, s.spec.MethodPrefix)
+	l, w, err := s.dial()
 	if err != nil {
 		// A host that has already stopped: its exit says more.
 		if ex, ok := acphost.ReadExit(s.t.dir); ok {
@@ -329,6 +321,16 @@ func (s *session) connect() error {
 	}
 	s.link, s.welcome = l, w
 	return nil
+}
+
+// hostBusy connects to the host in dir only to read whether a turn runs.
+func hostBusy(dir, prefix string) (bool, error) {
+	nc, _, w, err := acphost.Connect(context.Background(), dir, acphost.WithMethodPrefix(prefix))
+	if err != nil {
+		return false, err
+	}
+	_ = nc.Close()
+	return w.Busy, nil
 }
 
 // stopHost stops the host in dir, if one runs, and waits for it.
@@ -358,12 +360,11 @@ func (s *session) reconfigure(c Config) error {
 		return nil
 	}
 	if acphost.Alive(s.t.dir) {
-		l, w, err := dial(s.t.dir, s.spec.MethodPrefix)
+		busy, err := hostBusy(s.t.dir, s.spec.MethodPrefix)
 		if err != nil {
 			return fmt.Errorf("connect to the host: %w", err)
 		}
-		l.close()
-		if w.Busy {
+		if busy {
 			return errors.New("a turn is running, so the config cannot change now (attach waits for it, cancel stops it)")
 		}
 		if err := stopHost(s.t.dir); err != nil {

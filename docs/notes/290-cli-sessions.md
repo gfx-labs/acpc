@@ -2,18 +2,19 @@
 
 2026-11-11
 
-The CLI can hold a conversation with an ACP agent from a shell, the way
-acpx does, with the agent under acphost's isolation.
+acpc holds a conversation with an ACP agent from a shell, the way acpx
+does, with the agent under acphost's isolation. It started as commands of
+the acphost CLI and moved to its own repository (see the 2026-11-13 note).
 
 ```
-acphost new    [-s NAME] [-c FILE] [flags] [--lease 8h] -- CMD ARGS...
-acphost prompt [-s NAME] [-c FILE] [flags] [--no-wait] TEXT...
-acphost exec   [-c FILE] [flags] TEXT... -- CMD ARGS...
-acphost attach [-s NAME]
-acphost cancel [-s NAME]
-acphost ls     [--all] [--format text|json]
-acphost rm     -s NAME
-acphost status|stop|wait -s NAME
+acpc new    [-s NAME] [-c FILE] [flags] [--lease 8h] -- CMD ARGS...
+acpc prompt [-s NAME] [-c FILE] [flags] [--no-wait] TEXT...
+acpc exec   [-c FILE] [flags] TEXT... -- CMD ARGS...
+acpc attach [-s NAME]
+acpc cancel [-s NAME]
+acpc ls     [--all] [--format text|json]
+acpc rm     -s NAME
+acpc status|stop|wait -s NAME
 ```
 
 There are no agent names: the agent is the command after `--`
@@ -33,7 +34,7 @@ journal) plus two files of the CLI:
   clients on one session would cut each other off. A second `prompt` or
   `attach` is refused with the holder's pid.
 
-Named sessions are in `$XDG_STATE_HOME/acphost/sessions/<key>/<name>`
+Named sessions are in `$XDG_STATE_HOME/acpc/sessions/<key>/<name>`
 (`~/.local/state` without the variable). `<key>` is 12 hex digits of the
 SHA-256 of the working directory, so a name is a different session in each
 directory. It is a hash and not the path because the socket below it has

@@ -13,12 +13,9 @@ import (
 	"github.com/urfave/cli/v3"
 )
 
-// Lease defaults. A named session is only connected during a turn, so its
-// lease is the idle time between prompts, not a controller outage.
-const (
-	hostLease    = 30 * time.Minute
-	sessionLease = 8 * time.Hour
-)
+// sessionLease is the default lease of a named session. It is only
+// connected during a turn, so its lease is the idle time between prompts.
+const sessionLease = 8 * time.Hour
 
 // app is one command line: the streams the commands use and what followed
 // the first "--".
@@ -49,7 +46,7 @@ func exit(code int) error {
 
 // fail prints err and returns code as the action's result.
 func (a *app) fail(code int, err error) error {
-	say(a.stderr, "acphost:", err)
+	say(a.stderr, "acpc:", err)
 	return exitStatus(code)
 }
 
@@ -64,7 +61,7 @@ func (a *app) run(args []string) int {
 	case errors.As(err, &st):
 		return int(st)
 	}
-	say(a.stderr, "acphost:", err)
+	say(a.stderr, "acpc:", err)
 	return 2
 }
 
@@ -74,10 +71,10 @@ func (a *app) exec(args []string) error {
 		a.dashed, a.rest = true, args[i+1:]
 		args = args[:i]
 	}
-	return a.root.Run(context.Background(), append([]string{"acphost"}, args...))
+	return a.root.Run(context.Background(), append([]string{"acpc"}, args...))
 }
 
-// argv is the command of run, host, start and new: the arguments from the
+// argv is the agent command of new: the arguments from the
 // first one that is not a flag, as the flag package split them before.
 func (a *app) argv(cmd *cli.Command) []string {
 	pos := cmd.Args().Slice()
@@ -97,28 +94,16 @@ func newApp(stdin io.Reader, stdout, stderr io.Writer) *app {
 	a := &app{stdin: stdin, stdout: stdout, stderr: stderr}
 	commands := []*cli.Command{
 		{
-			Name: "run", Usage: "run one command attached to the terminal and exit with its status",
-			ArgsUsage: "-- CMD ARGS...", Flags: specFlags(), Action: a.cmdRun, StopOnNthArg: new(1),
+			Name: "status", Usage: "print whether a session's host is running, exited or lost, as JSON",
+			Flags: sessionFlags(), Action: a.cmdDetached,
 		},
 		{
-			Name: "host", Usage: "write spec.json into --dir and run the ACP host in the foreground",
-			ArgsUsage: "-- CMD ARGS...", Flags: specFlags(), Action: a.cmdRun, StopOnNthArg: new(1),
+			Name: "stop", Usage: "stop a session's host and print its exit; the next prompt starts it again",
+			Flags: append(sessionFlags(), graceFlag()), Action: a.cmdDetached,
 		},
 		{
-			Name: "start", Usage: "run a command, or with --host an ACP host, detached with its state in --dir",
-			ArgsUsage: "-- CMD ARGS...", Flags: specFlags(), Action: a.cmdStart, StopOnNthArg: new(1),
-		},
-		{
-			Name: "status", Usage: "print running, exited or lost as JSON",
-			Flags: append(sessionFlags(), graceFlag(true)), Action: a.cmdDetached,
-		},
-		{
-			Name: "stop", Usage: "stop a detached command or host and print its exit",
-			Flags: append(sessionFlags(), graceFlag(false)), Action: a.cmdDetached,
-		},
-		{
-			Name: "wait", Usage: "wait for a detached command or host and exit with its status",
-			Flags: append(sessionFlags(), graceFlag(true)), Action: a.cmdDetached,
+			Name: "wait", Usage: "wait for a session's host to exit and exit with the agent's status",
+			Flags: sessionFlags(), Action: a.cmdDetached,
 		},
 		{
 			Name: "new", Usage: "create a session: start its host detached and open an ACP session with the agent",
@@ -162,8 +147,8 @@ func newApp(stdin io.Reader, stdout, stderr io.Writer) *app {
 		},
 	}
 	a.root = &cli.Command{
-		Name:    "acphost",
-		Usage:   "run a command or an ACP agent session under acphost's isolation",
+		Name:    "acpc",
+		Usage:   "an ACP client: prompt an agent from a shell, with the conversation kept under a name",
 		Version: version(),
 		Reader:  stdin, Writer: stdout, ErrWriter: stderr,
 		// Actions return their exit status as an error; run maps it.
@@ -172,9 +157,9 @@ func newApp(stdin io.Reader, stdout, stderr io.Writer) *app {
 		Commands:       commands,
 		Action: func(_ context.Context, cmd *cli.Command) error {
 			if cmd.NArg() > 0 {
-				return fmt.Errorf("unknown command %q (see acphost --help)", cmd.Args().First())
+				return fmt.Errorf("unknown command %q (see acpc --help)", cmd.Args().First())
 			}
-			return errors.New("no command (see acphost --help)")
+			return errors.New("no command (see acpc --help)")
 		},
 	}
 	for _, c := range commands {
@@ -211,37 +196,17 @@ func isolationFlags() []cli.Flag {
 	}
 }
 
-// specFlags are the flags of run, host and start. The three share one set,
-// as before, and reject the ones that do not apply.
-func specFlags() []cli.Flag {
-	return join(isolationFlags(), []cli.Flag{
-		&cli.StringFlag{Name: "dir", Usage: "working dir (run), session dir (host) or state dir (start)"},
-		&cli.DurationFlag{Name: "lease", Value: hostLease, Usage: "host: exit after no controller for this long"},
-		&cli.DurationFlag{Name: "grace", Value: 10 * time.Second, Usage: "start: SIGTERM to SIGKILL delay on stop"},
-		&cli.StringFlag{Name: "listen", Usage: "host: also listen on this TCP `HOST:PORT` (an explicit host; port 0 picks one)"},
-		&cli.StringFlag{Name: "tls-cert", Usage: "host: server certificate (PEM) for the TCP listener"},
-		&cli.StringFlag{Name: "tls-key", Usage: "host: server key (PEM) for the TCP listener"},
-		&cli.StringFlag{Name: "tls-client-ca", Usage: "host: CA bundle (PEM) client certificates must chain to"},
-		&cli.StringSliceFlag{Name: "tls-allow", Usage: "host: allow only clients with this DNS or URI `SAN` (repeatable)"},
-		&cli.BoolFlag{Name: "print", Usage: "print the argv and isolation record, run nothing"},
-		&cli.BoolFlag{Name: "check", Usage: "run the pre-spawn checks only"},
-		&cli.BoolFlag{Name: "verbose", Aliases: []string{"v"}, Usage: "print the isolation record to stderr after the run"},
-		&cli.BoolFlag{Name: "host", Usage: "start: run an ACP host detached (--dir is the session dir)"},
-	})
-}
-
 // sessionFlags name a session directory: by name, or directly.
 func sessionFlags() []cli.Flag {
 	return []cli.Flag{
 		&cli.StringFlag{Name: "session", Aliases: []string{"s"}, Usage: "session `NAME`, scoped to the working directory"},
-		&cli.StringFlag{Name: "dir", Usage: "session or state `DIR`, instead of a name"},
+		&cli.StringFlag{Name: "dir", Usage: "session `DIR`, instead of a name"},
 	}
 }
 
-// graceFlag is stop's --grace. status and wait took it too before the
-// commands had their own flag sets, so they still accept it, hidden.
-func graceFlag(hidden bool) cli.Flag {
-	return &cli.DurationFlag{Name: "grace", Hidden: hidden, Usage: "SIGKILL the supervisor if it still runs after this long (0 waits)"}
+// graceFlag is stop's --grace.
+func graceFlag() cli.Flag {
+	return &cli.DurationFlag{Name: "grace", Value: stopGrace, Usage: "SIGKILL the host if it still runs after this long (0 waits)"}
 }
 
 // turnFlags are how a turn is shown and how permission requests are answered.

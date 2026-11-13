@@ -50,7 +50,7 @@ func sessionEnv(t *testing.T) string {
 	state := shortDir(t)
 	t.Setenv("XDG_STATE_HOME", state)
 	t.Chdir(shortDir(t))
-	root := filepath.Join(state, "acphost", "sessions")
+	root := filepath.Join(state, "acpc", "sessions")
 	stopHosts(t, filepath.Join(root, "*", "*"))
 	return root
 }
@@ -62,12 +62,12 @@ func acpIn(stdin string, args ...string) (code int, stdout, stderr string) {
 	return code, out.String(), errb.String()
 }
 
-func acp(args ...string) (code int, stdout, stderr string) { return acpIn("", args...) }
+func acpcRun(args ...string) (code int, stdout, stderr string) { return acpIn("", args...) }
 
 // mustAcp runs a command line that has to succeed and returns its stdout.
 func mustAcp(t *testing.T, args ...string) string {
 	t.Helper()
-	code, out, errs := acp(args...)
+	code, out, errs := acpcRun(args...)
 	require.Equal(t, 0, code, "%v: %s", args, errs)
 	return out
 }
@@ -112,14 +112,14 @@ func TestSessionConversation(t *testing.T) {
 	cwd, err := os.Getwd()
 	require.NoError(t, err)
 
-	code, _, errs := acp("prompt", "hello")
+	code, _, errs := acpcRun("prompt", "hello")
 	assert.Equal(t, 1, code)
-	assert.Contains(t, errs, "acphost new creates one")
+	assert.Contains(t, errs, "acpc new creates one")
 
 	dir := newSession(t, nil, agentLoads)
 	assert.Equal(t, defaultSession, filepath.Base(dir))
 	assert.True(t, strings.HasPrefix(dir, root+string(filepath.Separator)), dir)
-	code, _, errs = acp(append([]string{"new"}, fakeAgentCommand()...)...)
+	code, _, errs = acpcRun(append([]string{"new"}, fakeAgentCommand()...)...)
 	assert.Equal(t, 1, code)
 	assert.Contains(t, errs, "already exists")
 
@@ -145,7 +145,7 @@ func TestSessionConversation(t *testing.T) {
 	t.Chdir(shortDir(t))
 	assert.Empty(t, listSessions(t))
 	assert.Len(t, listSessions(t, "--all"), 1)
-	code, _, _ = acp("prompt", "hello")
+	code, _, _ = acpcRun("prompt", "hello")
 	assert.Equal(t, 1, code)
 	t.Chdir(cwd)
 
@@ -180,7 +180,7 @@ func TestSessionReloadFallback(t *testing.T) {
 			old := agentSession(t, mustAcp(t, "prompt", "remember", "apples"))
 			mustAcp(t, "stop", "-s", defaultSession)
 
-			code, out, errs := acp("prompt", "next")
+			code, out, errs := acpcRun("prompt", "next")
 			require.Equal(t, 0, code, errs)
 			assert.Contains(t, errs, "could not reload the conversation")
 			if tc.loadError != "" {
@@ -196,7 +196,7 @@ func TestSessionReloadFallback(t *testing.T) {
 			assert.Contains(t, text, "next")
 
 			// The new conversation is the session's from here on.
-			code, out, errs = acp("prompt", "more")
+			code, out, errs = acpcRun("prompt", "more")
 			require.Equal(t, 0, code, errs)
 			assert.NotContains(t, errs, "could not reload")
 			assert.Contains(t, out, fresh+"> more")
@@ -221,7 +221,7 @@ func TestSessionPermissions(t *testing.T) {
 		{[]string{"--approve-all"}, "edit", true},
 		{[]string{"--deny-all"}, "read", false},
 	} {
-		code, out, errs := acp(append(append([]string{"prompt"}, tc.flags...), "ask", tc.kind)...)
+		code, out, errs := acpcRun(append(append([]string{"prompt"}, tc.flags...), "ask", tc.kind)...)
 		require.Equal(t, 0, code, errs)
 		if tc.allowed {
 			assert.Contains(t, out, "permission: selected once", "%v %s", tc.flags, tc.kind)
@@ -231,7 +231,7 @@ func TestSessionPermissions(t *testing.T) {
 			assert.Contains(t, errs, "refused permission: touch "+tc.kind+" ("+tc.kind+")")
 		}
 	}
-	code, _, errs := acp("prompt", "--approve-all", "--deny-all", "ask", "read")
+	code, _, errs := acpcRun("prompt", "--approve-all", "--deny-all", "ask", "read")
 	assert.Equal(t, 2, code)
 	assert.Contains(t, errs, "one of")
 }
@@ -260,7 +260,7 @@ func TestSessionCancelForegroundTurn(t *testing.T) {
 	}
 
 	// The session has one client at a time.
-	code, _, errs := acp("prompt", "hi")
+	code, _, errs := acpcRun("prompt", "hi")
 	assert.Equal(t, 1, code)
 	assert.Contains(t, errs, "in use by pid")
 	assert.Equal(t, cmd.Process.Pid, listSessions(t)[0].ClientPid)
@@ -314,10 +314,10 @@ func TestSessionDetachedTurn(t *testing.T) {
 	require.NoError(t, os.WriteFile(config, []byte("env: [FOO=bar]\n"), 0o600))
 
 	assert.Empty(t, mustAcp(t, "prompt", "--no-wait", "wait", gate))
-	code, _, errs := acp("prompt", "second")
+	code, _, errs := acpcRun("prompt", "second")
 	assert.Equal(t, 1, code)
 	assert.Contains(t, errs, "a turn is running")
-	code, _, errs = acp("prompt", "-c", config, "second")
+	code, _, errs = acpcRun("prompt", "-c", config, "second")
 	assert.Equal(t, 1, code)
 	assert.Contains(t, errs, "the config cannot change now")
 
@@ -346,7 +346,7 @@ func TestSessionDetachedTurn(t *testing.T) {
 	out2 := mustAcp(t, "attach")
 	assert.Contains(t, out2, "cancel requested")
 	assert.Contains(t, out2, "cancelled")
-	code, _, errs = acp("cancel")
+	code, _, errs = acpcRun("cancel")
 	assert.Equal(t, 0, code)
 	assert.Contains(t, errs, "no turn is running")
 }
@@ -412,7 +412,7 @@ func TestExec(t *testing.T) {
 		stderr string
 	}{
 		"text":            {args: []string{"--format", "quiet", "hi", "there"}, stdout: `^sess-\d+> hi there\n$`},
-		"handshake":       {args: []string{"hi"}, stdout: `(?s)^\[acphost\] spawning agent: .*\[client\] initialize \(running\)\n\[client\] initialized .*\[client\] session/new .*\[client\] session sess-\d+\n=== turn .*end_turn\n$`},
+		"handshake":       {args: []string{"hi"}, stdout: `(?s)^\[acpc\] spawning agent: .*\[client\] initialize \(running\)\n\[client\] initialized .*\[client\] session/new .*\[client\] session sess-\d+\n=== turn .*end_turn\n$`},
 		"stdin":           {args: []string{"--format", "quiet"}, stdin: "from stdin", stdout: `^sess-\d+> from stdin\n$`},
 		"config":          {args: []string{"-c", cfg, "--format", "quiet", "env", "FOO"}, stdout: `^FOO=bar\n$`},
 		"stop reason":     {args: []string{"stop", "max_tokens"}, code: 1, stderr: "the turn stopped: max_tokens"},

@@ -12,6 +12,8 @@ import (
 	"text/tabwriter"
 	"time"
 
+	acp "github.com/gfx-labs/go-acp"
+
 	"github.com/gfx-labs/acphost/pkg/acphost"
 	"github.com/gfx-labs/acphost/pkg/proc"
 	"github.com/urfave/cli/v3"
@@ -174,9 +176,17 @@ func (s *session) turn(text string) int {
 		return s.report(err)
 	}
 	s.inTurn = true
-	res, err := s.call("session/prompt", s.prompt(text))
+	var res acp.PromptResponse
+	err = s.wait(func(ctx context.Context) error {
+		var err error
+		res, err = s.link.conn.Prompt(ctx, s.promptRequest(text))
+		return err
+	}, nil)
 	s.inTurn = false
-	code := s.turnStatus(res, err)
+	if err != nil {
+		err = fmt.Errorf("session/prompt: %w", err)
+	}
+	code := s.turnStatus(res.StopReason, err)
 	s.out.end()
 	return code
 }
@@ -195,38 +205,27 @@ func (s *session) ready(text string) (string, error) {
 	return text, nil
 }
 
-func (s *session) prompt(text string) promptParams {
-	return promptParams{SessionID: s.state.ACPSession, Prompt: []contentText{{Type: "text", Text: text}}}
-}
-
 // submit sends one prompt and returns once the host has journaled it. A
 // client that disconnected or was replaced sooner could lose the prompt:
 // the host closes a replaced connection without reading what is left on it.
+// Prompt runs with a context that never ends: go-acp sends session/cancel
+// when it does. Closing the connection ends the call instead, and the turn
+// keeps running.
 func (s *session) submit(text string) int {
 	text, err := s.ready(text)
 	if err != nil {
 		return s.report(err)
 	}
-	if _, err := s.request("session/prompt", s.prompt(text)); err != nil {
-		return s.report(err)
-	}
+	go func() { _, _ = s.link.conn.Prompt(context.Background(), s.promptRequest(text)) }()
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	go func() {
-		for {
-			select {
-			case _, ok := <-s.link.in:
-				if !ok {
-					cancel()
-					return
-				}
-			case <-s.sigs:
-				cancel()
-				return
-			case <-ctx.Done():
-				return
-			}
+		select {
+		case <-s.link.served:
+		case <-s.sigs:
+		case <-ctx.Done():
 		}
+		cancel()
 	}()
 	taken := false
 	err = acphost.FollowJournal(ctx, s.journal(), s.off, func(fr acphost.Frame) {
@@ -363,7 +362,7 @@ func (a *app) cmdExec(_ context.Context, cmd *cli.Command) error {
 	if err != nil {
 		return err
 	}
-	dir, err := os.MkdirTemp("", "acphost-exec-")
+	dir, err := os.MkdirTemp("", "acpc-exec-")
 	if err != nil {
 		return a.fail(1, err)
 	}
@@ -385,7 +384,7 @@ func (a *app) cmdExec(_ context.Context, cmd *cli.Command) error {
 	}
 	s.close()
 	if err := stopHost(dir); err != nil {
-		say(a.stderr, "acphost:", err)
+		say(a.stderr, "acpc:", err)
 	}
 	return exit(code)
 }
@@ -410,7 +409,7 @@ func (a *app) cmdAttach(_ context.Context, cmd *cli.Command) error {
 	defer out.end()
 	if !acphost.Alive(t.dir) {
 		s.catchUp()
-		say(a.stderr, "acphost: the host is not running (the next prompt starts it)")
+		say(a.stderr, "acpc: the host is not running (the next prompt starts it)")
 		return nil
 	}
 	if err := s.connect(); err != nil {
@@ -460,7 +459,7 @@ func (a *app) cmdCancel(_ context.Context, cmd *cli.Command) error {
 	}
 	if !busy {
 		if !interrupted {
-			say(a.stderr, "acphost: no turn is running")
+			say(a.stderr, "acpc: no turn is running")
 		}
 		return nil
 	}

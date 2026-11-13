@@ -1,130 +1,32 @@
 package main
 
 import (
-	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
+	"encoding/json/jsontext"
+	jsonv2 "encoding/json/v2"
 	"errors"
 	"fmt"
 	"net"
 	"os"
 	"path/filepath"
-	"strconv"
+
+	acp "github.com/gfx-labs/go-acp"
 
 	"github.com/gfx-labs/acphost/pkg/acphost"
 )
 
-// The ACP client side of a session: JSON-RPC over the host's socket. The
-// host forwards everything to the agent except its own extension methods.
-// What the agent did is shown from the journal, not from the socket: a
-// journal frame has a seq, so the client knows exactly what it has shown.
-// A message on the socket only says that the journal has grown.
-
-// message is one JSON-RPC message.
-type message struct {
-	JSONRPC string          `json:"jsonrpc"`
-	ID      json.RawMessage `json:"id,omitempty"`
-	Method  string          `json:"method,omitempty"`
-	Params  json.RawMessage `json:"params,omitempty"`
-	Result  json.RawMessage `json:"result,omitempty"`
-	Error   *rpcError       `json:"error,omitempty"`
-}
-
-// rpcError is a JSON-RPC error object.
-type rpcError struct {
-	Code    int             `json:"code"`
-	Message string          `json:"message"`
-	Data    json.RawMessage `json:"data,omitempty"`
-}
-
-func (e *rpcError) Error() string {
-	s := fmt.Sprintf("%s (code %d)", e.Message, e.Code)
-	if len(e.Data) > 0 && string(e.Data) != "null" {
-		s += ": " + string(e.Data)
-	}
-	return s
-}
+// The ACP client side of a session, over the host's socket, with go-acp
+// for the protocol. The host forwards everything to the agent except its
+// own extension methods. What the agent did is shown from the journal,
+// not from the socket: a journal frame has a seq, so the client knows
+// exactly what it has shown. A message on the socket only says that the
+// journal has grown.
 
 // errInterrupted is a signal that ends the command: one outside a turn,
 // or a second one while a turn is being cancelled.
 var errInterrupted = errors.New("interrupted")
-
-// ACP message bodies, only the fields this client uses.
-type (
-	initializeParams struct {
-		ProtocolVersion    int                `json:"protocolVersion"`
-		ClientCapabilities clientCapabilities `json:"clientCapabilities"`
-		ClientInfo         clientInfo         `json:"clientInfo"`
-	}
-	// clientCapabilities offers nothing: the agent reads and writes files
-	// and runs commands itself, inside its sandbox.
-	clientCapabilities struct {
-		FS       fsCapabilities `json:"fs"`
-		Terminal bool           `json:"terminal"`
-	}
-	fsCapabilities struct {
-		ReadTextFile  bool `json:"readTextFile"`
-		WriteTextFile bool `json:"writeTextFile"`
-	}
-	clientInfo struct {
-		Name    string `json:"name"`
-		Version string `json:"version"`
-	}
-	initializeResult struct {
-		ProtocolVersion int `json:"protocolVersion"`
-		AgentInfo       struct {
-			Name    string `json:"name"`
-			Version string `json:"version"`
-		} `json:"agentInfo"`
-		AgentCapabilities struct {
-			LoadSession bool `json:"loadSession"`
-		} `json:"agentCapabilities"`
-	}
-	sessionParams struct {
-		SessionID  string   `json:"sessionId,omitempty"`
-		Cwd        string   `json:"cwd"`
-		McpServers []string `json:"mcpServers"`
-	}
-	sessionResult struct {
-		SessionID string `json:"sessionId"`
-	}
-	promptParams struct {
-		SessionID string        `json:"sessionId"`
-		Prompt    []contentText `json:"prompt"`
-	}
-	contentText struct {
-		Type string `json:"type"`
-		Text string `json:"text"`
-	}
-	cancelParams struct {
-		SessionID string `json:"sessionId"`
-	}
-	promptResult struct {
-		StopReason string `json:"stopReason"`
-	}
-	permissionParams struct {
-		ToolCall struct {
-			ToolCallID string `json:"toolCallId"`
-			Title      string `json:"title"`
-			Kind       string `json:"kind"`
-		} `json:"toolCall"`
-		Options []struct {
-			OptionID string `json:"optionId"`
-			Kind     string `json:"kind"`
-		} `json:"options"`
-	}
-	permissionResult struct {
-		Outcome permissionOutcome `json:"outcome"`
-	}
-	permissionOutcome struct {
-		Outcome  string `json:"outcome"` // selected or cancelled
-		OptionID string `json:"optionId,omitempty"`
-	}
-)
-
-// acpProtocolVersion is the ACP version this client speaks.
-const acpProtocolVersion = 1
 
 // Permission policies.
 const (
@@ -135,57 +37,114 @@ const (
 
 // link is a connection to a session's host.
 type link struct {
-	nc     net.Conn
-	in     chan []byte // lines from the host; closed when the connection ends
-	done   chan struct{}
-	nextID int
+	nc   net.Conn
+	conn *acp.ClientSideConnection
+	// activity has a value when the host sent something since the last
+	// look, so the journal has grown.
+	activity chan struct{}
+	// turnEnd gets the host's turn_end notification: the end of a turn
+	// another connection started.
+	turnEnd chan acphost.TurnEnd
+	served  chan struct{} // closed when Serve has returned
 }
 
-func dial(dir, prefix string) (*link, acphost.Welcome, error) {
-	nc, rd, w, err := acphost.Connect(context.Background(), dir, acphost.WithMethodPrefix(prefix))
+// dial connects to the session's host and serves the agent's messages
+// until the connection ends.
+func (s *session) dial() (*link, acphost.Welcome, error) {
+	nc, rd, w, err := acphost.Connect(context.Background(), s.t.dir, acphost.WithMethodPrefix(s.spec.MethodPrefix))
 	if err != nil {
 		return nil, w, err
 	}
-	l := &link{nc: nc, in: make(chan []byte, 64), done: make(chan struct{})}
-	go l.read(rd)
+	l := &link{
+		nc: nc, activity: make(chan struct{}, 1),
+		turnEnd: make(chan acphost.TurnEnd, 1), served: make(chan struct{}),
+	}
+	l.conn = acp.NewClientSideConnection(&agentRequests{s: s, l: l}, nc, rd, nil)
+	end := acphost.MethodName(w.MethodPrefix, "turn_end")
+	if err := l.conn.RegisterExtensionNotification(end, func(_ context.Context, _ string, params jsontext.Value) (any, *acp.RequestError) {
+		var te acphost.TurnEnd
+		_ = json.Unmarshal(params, &te)
+		select {
+		case l.turnEnd <- te:
+		default:
+		}
+		return nil, nil
+	}); err != nil {
+		_ = nc.Close()
+		return nil, w, err
+	}
+	go func() {
+		defer close(l.served)
+		_ = l.conn.Serve(context.Background())
+	}()
 	return l, w, nil
 }
 
-func (l *link) read(rd *bufio.Reader) {
-	defer close(l.in)
-	for {
-		line, err := rd.ReadBytes('\n')
-		if line = bytes.TrimSpace(line); len(line) > 0 {
-			select {
-			case l.in <- line:
-			case <-l.done:
-				return
-			}
-		}
-		if err != nil {
-			return
-		}
+// grew notes that the journal has grown.
+func (l *link) grew() {
+	select {
+	case l.activity <- struct{}{}:
+	default:
 	}
-}
-
-func (l *link) send(m message) error {
-	m.JSONRPC = "2.0"
-	b, err := json.Marshal(m)
-	if err != nil {
-		return err
-	}
-	_, err = l.nc.Write(append(b, '\n'))
-	return err
 }
 
 func (l *link) close() {
-	close(l.done)
 	_ = l.nc.Close()
+	<-l.served
 }
 
-func rawJSON(v any) json.RawMessage {
-	b, _ := json.Marshal(v)
-	return b
+// agentRequests answers what the agent asks of the client. Only permission
+// requests are served; the client offers no file, terminal or elicitation
+// capability, so the agent does that work itself, inside its sandbox.
+type agentRequests struct {
+	s *session
+	l *link
+}
+
+func (r *agentRequests) SessionUpdate(context.Context, acp.SessionNotification) error {
+	r.l.grew()
+	return nil
+}
+
+func (r *agentRequests) RequestPermission(_ context.Context, p acp.RequestPermissionRequest) (acp.RequestPermissionResponse, error) {
+	r.l.grew()
+	return acp.RequestPermissionResponse{Outcome: r.s.permit(p)}, nil
+}
+
+func (r *agentRequests) CompleteElicitation(context.Context, acp.CompleteElicitationNotification) error {
+	return nil
+}
+
+func (r *agentRequests) CreateElicitation(context.Context, acp.CreateElicitationRequest) (acp.CreateElicitationResponse, error) {
+	return acp.CreateElicitationResponse{}, acp.NewMethodNotFound(acp.ClientMethodElicitationCreate)
+}
+
+func (r *agentRequests) ReadTextFile(context.Context, acp.ReadTextFileRequest) (acp.ReadTextFileResponse, error) {
+	return acp.ReadTextFileResponse{}, acp.NewMethodNotFound(acp.ClientMethodFsReadTextFile)
+}
+
+func (r *agentRequests) WriteTextFile(context.Context, acp.WriteTextFileRequest) (acp.WriteTextFileResponse, error) {
+	return acp.WriteTextFileResponse{}, acp.NewMethodNotFound(acp.ClientMethodFsWriteTextFile)
+}
+
+func (r *agentRequests) CreateTerminal(context.Context, acp.CreateTerminalRequest) (acp.CreateTerminalResponse, error) {
+	return acp.CreateTerminalResponse{}, acp.NewMethodNotFound(acp.ClientMethodTerminalCreate)
+}
+
+func (r *agentRequests) KillTerminal(context.Context, acp.KillTerminalRequest) (acp.KillTerminalResponse, error) {
+	return acp.KillTerminalResponse{}, acp.NewMethodNotFound(acp.ClientMethodTerminalKill)
+}
+
+func (r *agentRequests) TerminalOutput(context.Context, acp.TerminalOutputRequest) (acp.TerminalOutputResponse, error) {
+	return acp.TerminalOutputResponse{}, acp.NewMethodNotFound(acp.ClientMethodTerminalOutput)
+}
+
+func (r *agentRequests) ReleaseTerminal(context.Context, acp.ReleaseTerminalRequest) (acp.ReleaseTerminalResponse, error) {
+	return acp.ReleaseTerminalResponse{}, acp.NewMethodNotFound(acp.ClientMethodTerminalRelease)
+}
+
+func (r *agentRequests) WaitForTerminalExit(context.Context, acp.WaitForTerminalExitRequest) (acp.WaitForTerminalExitResponse, error) {
+	return acp.WaitForTerminalExitResponse{}, acp.NewMethodNotFound(acp.ClientMethodTerminalWaitForExit)
 }
 
 // tracef writes a step of the ACP handshake when the session traces them.
@@ -238,33 +197,39 @@ func (s *session) render(frames []acphost.Frame) {
 	}
 }
 
-// wait handles messages from the host until one satisfies until. It
-// answers the agent's requests, and on a signal cancels the running turn.
-func (s *session) wait(until func(message) bool) (message, error) {
+// wait runs fn, which talks to the agent, and shows the journal as the
+// host's messages arrive until fn returns or done has a value. A signal
+// cancels the running turn.
+func (s *session) wait(fn func(context.Context) error, done <-chan struct{}) error {
+	result := make(chan error, 1)
+	if fn != nil {
+		go func() { result <- fn(context.Background()) }()
+	}
+	served := s.link.served
 	for {
 		select {
-		case line, ok := <-s.link.in:
+		case err := <-result:
 			// The host journals a frame before it sends it.
 			s.show()
-			if !ok {
-				return message{}, s.lost()
+			if errors.Is(err, acp.ErrClosed) {
+				return s.lost()
 			}
-			var m message
-			if json.Unmarshal(line, &m) != nil {
-				continue
+			return err
+		case <-done:
+			s.show()
+			return nil
+		case <-s.link.activity:
+			s.show()
+		case <-served:
+			if fn == nil {
+				s.show()
+				return s.lost()
 			}
-			if m.Method != "" && len(m.ID) > 0 {
-				if err := s.answer(m); err != nil {
-					return message{}, err
-				}
-				continue
-			}
-			if until(m) {
-				return m, nil
-			}
+			// fn returns acp.ErrClosed, or a response read just before.
+			served = nil
 		case <-s.sigs:
 			if err := s.interrupt(); err != nil {
-				return message{}, err
+				return err
 			}
 		}
 	}
@@ -303,79 +268,49 @@ func (s *session) interrupt() error {
 	if !s.inTurn || s.interrupts > 1 {
 		return errInterrupted
 	}
-	say(s.a.stderr, "acphost: cancelling the turn (interrupt again to stop waiting)")
+	say(s.a.stderr, "acpc: cancelling the turn (interrupt again to stop waiting)")
 	return s.cancelTurn()
 }
 
 func (s *session) cancelTurn() error {
 	// From here on a permission request is answered as cancelled, as ACP asks.
-	s.cancelling = true
-	return s.link.send(message{Method: "session/cancel", Params: rawJSON(cancelParams{SessionID: s.state.ACPSession})})
-}
-
-// request sends a request and returns its id without waiting.
-func (s *session) request(method string, params any) (json.RawMessage, error) {
-	s.link.nextID++
-	id := json.RawMessage(strconv.Itoa(s.link.nextID))
-	return id, s.link.send(message{ID: id, Method: method, Params: rawJSON(params)})
-}
-
-// call sends a request and waits for its response.
-func (s *session) call(method string, params any) (json.RawMessage, error) {
-	id, err := s.request(method, params)
-	if err != nil {
-		return nil, err
-	}
-	m, err := s.wait(func(m message) bool { return m.Method == "" && bytes.Equal(m.ID, id) })
-	if err != nil {
-		return nil, err
-	}
-	if m.Error != nil {
-		return nil, fmt.Errorf("%s: %w", method, m.Error)
-	}
-	return m.Result, nil
-}
-
-// answer replies to a request from the agent. Only permission requests
-// are served; the client offers no file or terminal capability.
-func (s *session) answer(m message) error {
-	if m.Method != "session/request_permission" {
-		return s.link.send(message{ID: m.ID, Error: &rpcError{Code: -32601, Message: "method not found: " + m.Method}})
-	}
-	var p permissionParams
-	_ = json.Unmarshal(m.Params, &p)
-	return s.link.send(message{ID: m.ID, Result: rawJSON(permissionResult{Outcome: s.permit(p)})})
+	s.cancelling.Store(true)
+	return s.link.conn.Cancel(context.Background(), acp.CancelNotification{SessionId: acp.SessionId(s.state.ACPSession)})
 }
 
 // permit picks the option the policy allows: an allow or a reject option,
 // the one-time kind first so nothing outlasts the request.
-func (s *session) permit(p permissionParams) permissionOutcome {
-	if s.cancelling {
-		return permissionOutcome{Outcome: "cancelled"}
+func (s *session) permit(p acp.RequestPermissionRequest) acp.RequestPermissionOutcome {
+	if s.cancelling.Load() {
+		return acp.NewRequestPermissionOutcomeCancelled()
 	}
-	kind := p.ToolCall.Kind
-	allow := s.policy == approveAll || (s.policy == approveReads && (kind == "read" || kind == "search"))
-	want := []string{"reject_once", "reject_always"}
+	var kind acp.ToolKind
+	if p.ToolCall.Kind != nil {
+		kind = *p.ToolCall.Kind
+	}
+	allow := s.policy == approveAll || (s.policy == approveReads && (kind == acp.ToolKindRead || kind == acp.ToolKindSearch))
+	want := []acp.PermissionOptionKind{acp.PermissionOptionKindRejectOnce, acp.PermissionOptionKindRejectAlways}
 	if allow {
-		want = []string{"allow_once", "allow_always"}
+		want = []acp.PermissionOptionKind{acp.PermissionOptionKindAllowOnce, acp.PermissionOptionKindAllowAlways}
 	} else {
-		what := p.ToolCall.Title
-		if what == "" {
-			what = "tool call " + p.ToolCall.ToolCallID
+		what := "tool call " + string(p.ToolCall.ToolCallId)
+		if p.ToolCall.Title != nil && *p.ToolCall.Title != "" {
+			what = *p.ToolCall.Title
 		}
-		if kind == "" {
-			kind = "kind not given"
+		shown := string(kind)
+		if shown == "" {
+			shown = "kind not given"
 		}
-		sayf(s.a.stderr, "acphost: refused permission: %s (%s); --approve-all allows it\n", what, kind)
+		sayf(s.a.stderr, "acpc: refused permission: %s (%s); --approve-all allows it\n", what, shown)
 	}
 	for _, k := range want {
 		for _, o := range p.Options {
 			if o.Kind == k {
-				return permissionOutcome{Outcome: "selected", OptionID: o.OptionID}
+				return acp.NewRequestPermissionOutcomeSelected(o.OptionId)
 			}
 		}
 	}
-	return permissionOutcome{Outcome: "cancelled"}
+	return acp.NewRequestPermissionOutcomeCancelled()
 }
 
 // ensure makes the agent ready for a prompt: initialized, and with the ACP
@@ -391,24 +326,36 @@ func (s *session) ensure() (seed string, err error) {
 		s.show()
 		s.muted = false
 	}()
-	init := s.welcome.Initialize
-	sent := len(init) == 0
-	if sent {
-		s.tracef("[client] initialize (running)")
-		init, err = s.call("initialize", initializeParams{
-			ProtocolVersion: acpProtocolVersion,
-			ClientInfo:      clientInfo{Name: "acphost", Version: version()},
-		})
-		if err != nil {
-			return "", err
+	var init acp.InitializeResponse
+	if len(s.welcome.Initialize) > 0 {
+		// The host replays the answer of the agent's one initialize.
+		if err := jsonv2.Unmarshal(s.welcome.Initialize, &init); err != nil {
+			return "", fmt.Errorf("initialize result from the host: %w", err)
 		}
-		s.welcome.Initialize = init
-	}
-	var caps initializeResult
-	_ = json.Unmarshal(init, &caps)
-	if sent {
+	} else {
+		s.tracef("[client] initialize (running)")
+		err := s.wait(func(ctx context.Context) error {
+			var err error
+			init, err = s.link.conn.Initialize(ctx, acp.InitializeRequest{
+				ProtocolVersion: acp.ProtocolVersion(acp.ProtocolVersionNumber),
+				ClientInfo:      &acp.Implementation{Name: "acpc", Version: version()},
+			})
+			return err
+		}, nil)
+		if err != nil {
+			return "", fmt.Errorf("initialize: %w", err)
+		}
+		// The host only caches it for the next connection; this one asks
+		// ensure again before the prompt.
+		if b, err := jsonv2.Marshal(init); err == nil {
+			s.welcome.Initialize = b
+		}
+		agent := acp.Implementation{}
+		if init.AgentInfo != nil {
+			agent = *init.AgentInfo
+		}
 		s.tracef("[client] initialized protocol version %d, agent %s %s, loadSession %t",
-			caps.ProtocolVersion, caps.AgentInfo.Name, caps.AgentInfo.Version, caps.AgentCapabilities.LoadSession)
+			init.ProtocolVersion, agent.Name, agent.Version, init.AgentCapabilities.LoadSession)
 	}
 	switch {
 	case s.state.ACPSession == "":
@@ -416,37 +363,46 @@ func (s *session) ensure() (seed string, err error) {
 	case s.state.HostPid == s.welcome.Pid:
 		return "", nil
 	}
-	if caps.AgentCapabilities.LoadSession {
+	if init.AgentCapabilities.LoadSession {
 		s.tracef("[client] session/load %s (running)", s.state.ACPSession)
-		_, err := s.call("session/load", sessionParams{SessionID: s.state.ACPSession, Cwd: s.spec.Dir, McpServers: []string{}})
+		err := s.wait(func(ctx context.Context) error {
+			_, err := s.link.conn.LoadSession(ctx, acp.LoadSessionRequest{
+				SessionId: acp.SessionId(s.state.ACPSession), Cwd: s.spec.Dir, McpServers: []acp.McpServer{},
+			})
+			return err
+		}, nil)
 		if err == nil {
 			return "", s.opened(s.state.ACPSession)
 		}
-		var refused *rpcError
+		var refused *acp.RequestError
 		if !errors.As(err, &refused) {
 			return "", err
 		}
-		say(s.a.stderr, "acphost:", err)
+		say(s.a.stderr, "acpc: session/load:", err)
 	}
 	// As jobshop does: a failed load would fail again on every restart.
 	frames, _, _ := acphost.ReadJournal(s.journal(), 0)
 	seed = acphost.Summarize(frames, 0)
-	say(s.a.stderr, "acphost: the agent could not reload the conversation; starting a new one from a summary of the journal")
+	say(s.a.stderr, "acpc: the agent could not reload the conversation; starting a new one from a summary of the journal")
 	return seed, s.newSession()
 }
 
 func (s *session) newSession() error {
 	s.tracef("[client] session/new cwd %s (running)", s.spec.Dir)
-	res, err := s.call("session/new", sessionParams{Cwd: s.spec.Dir, McpServers: []string{}})
-	if err != nil {
+	var res acp.NewSessionResponse
+	err := s.wait(func(ctx context.Context) error {
+		var err error
+		res, err = s.link.conn.NewSession(ctx, acp.NewSessionRequest{Cwd: s.spec.Dir, McpServers: []acp.McpServer{}})
 		return err
+	}, nil)
+	if err != nil {
+		return fmt.Errorf("session/new: %w", err)
 	}
-	var r sessionResult
-	if err := json.Unmarshal(res, &r); err != nil || r.SessionID == "" {
-		return fmt.Errorf("session/new: no sessionId in %s", res)
+	if res.SessionId == "" {
+		return errors.New("session/new: no sessionId in the result")
 	}
-	s.tracef("[client] session %s", r.SessionID)
-	return s.opened(r.SessionID)
+	s.tracef("[client] session %s", res.SessionId)
+	return s.opened(string(res.SessionId))
 }
 
 // opened records that the agent process behind this host has the ACP
@@ -456,40 +412,55 @@ func (s *session) opened(id string) error {
 	return writeState(s.t.dir, s.state)
 }
 
+// promptRequest is a session/prompt with one text block.
+func (s *session) promptRequest(text string) acp.PromptRequest {
+	return acp.PromptRequest{
+		SessionId: acp.SessionId(s.state.ACPSession),
+		Prompt:    []acp.ContentBlock{{Text: &acp.ContentBlockText{Type: "text", Text: text}}},
+	}
+}
+
 // awaitTurn waits for a turn another connection started. The host reports
 // its end with the turn_end extension method. A signal ends the wait and
 // leaves the turn running.
-func (s *session) awaitTurn() (json.RawMessage, error) {
-	end := acphost.MethodName(s.spec.MethodPrefix, "turn_end")
-	m, err := s.wait(func(m message) bool { return m.Method == end })
-	if err != nil {
-		return nil, err
-	}
+func (s *session) awaitTurn() (acp.StopReason, error) {
+	ended := make(chan struct{})
 	var te acphost.TurnEnd
-	_ = json.Unmarshal(m.Params, &te)
-	if len(te.Error) > 0 {
-		var re rpcError
-		_ = json.Unmarshal(te.Error, &re)
-		return nil, fmt.Errorf("session/prompt: %w", &re)
+	go func() {
+		select {
+		case te = <-s.link.turnEnd:
+			close(ended)
+		case <-s.link.served:
+		}
+	}()
+	if err := s.wait(nil, ended); err != nil {
+		return "", err
 	}
-	return te.Result, nil
+	if len(te.Error) > 0 {
+		var re acp.RequestError
+		_ = json.Unmarshal(te.Error, &re)
+		return "", fmt.Errorf("session/prompt: %w", &re)
+	}
+	var r struct {
+		StopReason acp.StopReason `json:"stopReason"`
+	}
+	_ = json.Unmarshal(te.Result, &r)
+	return r.StopReason, nil
 }
 
 // turnStatus is the exit status for a finished turn: 0 for end_turn, 130
 // for a cancelled one, 1 for any other stop reason or an error.
-func (s *session) turnStatus(res json.RawMessage, err error) int {
+func (s *session) turnStatus(stop acp.StopReason, err error) int {
 	if err != nil {
 		return s.report(err)
 	}
-	var r promptResult
-	_ = json.Unmarshal(res, &r)
-	switch r.StopReason {
-	case "end_turn":
+	switch stop {
+	case acp.StopReasonEndTurn:
 		return 0
-	case "cancelled":
+	case acp.StopReasonCancelled:
 		return 130
 	}
-	say(s.a.stderr, "acphost: the turn stopped:", r.StopReason)
+	say(s.a.stderr, "acpc: the turn stopped:", stop)
 	return 1
 }
 
@@ -499,11 +470,11 @@ func (s *session) report(err error) int {
 	if errors.Is(err, errInterrupted) {
 		return 130
 	}
-	say(s.a.stderr, "acphost:", err)
+	say(s.a.stderr, "acpc:", err)
 	var gone *hostGone
 	if errors.As(err, &gone) {
 		if tail := hostLogTail(s.t.dir); tail != "" {
-			sayf(s.a.stderr, "acphost: end of %s:\n%s\n", filepath.Join(s.t.dir, acphost.LogFile), tail)
+			sayf(s.a.stderr, "acpc: end of %s:\n%s\n", filepath.Join(s.t.dir, acphost.LogFile), tail)
 		}
 		// bwrap reports a command it cannot run after the host is up.
 		if gone.exit.Reason == acphost.ReasonSpawnFailed {
@@ -517,8 +488,7 @@ func (s *session) report(err error) int {
 	return 1
 }
 
-// spawnError is a host that could not be started: exit 125, as start
-// reports it.
+// spawnError is a host that could not be started: exit 125.
 type spawnError struct{ err error }
 
 func (e *spawnError) Error() string { return e.err.Error() }
@@ -526,7 +496,9 @@ func (e *spawnError) Unwrap() error { return e.err }
 
 // frameMethod is the JSON-RPC method of a journal frame.
 func frameMethod(fr acphost.Frame) string {
-	var m message
+	var m struct {
+		Method string `json:"method"`
+	}
 	_ = json.Unmarshal(fr.Msg, &m)
 	return m.Method
 }
