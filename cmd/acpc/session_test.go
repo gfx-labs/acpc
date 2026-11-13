@@ -11,6 +11,9 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
+
+	"github.com/gfx-labs/acpc/pkg/acpc"
 
 	"github.com/gfx-labs/acphost/pkg/acphost"
 	"github.com/stretchr/testify/assert"
@@ -38,7 +41,7 @@ func stopHosts(t *testing.T, glob string) {
 	t.Cleanup(func() {
 		dirs, _ := filepath.Glob(glob)
 		for _, d := range dirs {
-			_ = stopHost(d)
+			_ = acpc.StopHost(d)
 		}
 	})
 }
@@ -98,7 +101,7 @@ func listSessions(t *testing.T, flags ...string) []listed {
 func hostPid(t *testing.T) int {
 	t.Helper()
 	var st statusOut
-	out := mustAcp(t, "status", "-s", defaultSession)
+	out := mustAcp(t, "status", "-s", acpc.DefaultSession)
 	require.NoError(t, json.Unmarshal([]byte(out), &st), out)
 	require.Equal(t, "running", st.State)
 	return st.Pid
@@ -117,7 +120,7 @@ func TestSessionConversation(t *testing.T) {
 	assert.Contains(t, errs, "acpc new creates one")
 
 	dir := newSession(t, nil, agentLoads)
-	assert.Equal(t, defaultSession, filepath.Base(dir))
+	assert.Equal(t, acpc.DefaultSession, filepath.Base(dir))
 	assert.True(t, strings.HasPrefix(dir, root+string(filepath.Separator)), dir)
 	code, _, errs = acpcRun(append([]string{"new"}, fakeAgentCommand()...)...)
 	assert.Equal(t, 1, code)
@@ -135,7 +138,7 @@ func TestSessionConversation(t *testing.T) {
 
 	l := listSessions(t)
 	require.Len(t, l, 1)
-	assert.Equal(t, defaultSession, l[0].Name)
+	assert.Equal(t, acpc.DefaultSession, l[0].Name)
 	assert.Equal(t, "running", l[0].State)
 	assert.Equal(t, cwd, l[0].Cwd)
 	assert.Equal(t, fakeAgentCommand(agentLoads)[1:], l[0].Command)
@@ -152,14 +155,14 @@ func TestSessionConversation(t *testing.T) {
 	// A stopped host: the next prompt starts one, and the new agent loads
 	// the conversation. What it replays while loading is not shown.
 	first := hostPid(t)
-	mustAcp(t, "stop", "-s", defaultSession)
+	mustAcp(t, "stop", "-s", acpc.DefaultSession)
 	assert.Equal(t, "stopped", listSessions(t)[0].State)
 	out = mustAcp(t, "prompt", "third")
 	assert.Contains(t, out, id+"> third")
 	assert.NotContains(t, out, "replayed")
 	assert.NotEqual(t, first, hostPid(t))
 
-	mustAcp(t, "rm", "-s", defaultSession)
+	mustAcp(t, "rm", "-s", acpc.DefaultSession)
 	assert.NoDirExists(t, dir)
 	assert.Empty(t, listSessions(t))
 }
@@ -178,7 +181,7 @@ func TestSessionReloadFallback(t *testing.T) {
 			sessionEnv(t)
 			newSession(t, nil, tc.mode...)
 			old := agentSession(t, mustAcp(t, "prompt", "remember", "apples"))
-			mustAcp(t, "stop", "-s", defaultSession)
+			mustAcp(t, "stop", "-s", acpc.DefaultSession)
 
 			code, out, errs := acpcRun("prompt", "next")
 			require.Equal(t, 0, code, errs)
@@ -259,10 +262,12 @@ func TestSessionCancelForegroundTurn(t *testing.T) {
 		shown.WriteString(line)
 	}
 
-	// The session has one client at a time.
-	code, _, errs := acpcRun("prompt", "hi")
-	assert.Equal(t, 1, code)
-	assert.Contains(t, errs, "in use by pid")
+	// A second prompt queues behind the running turn and runs after it.
+	queuedOut := make(chan string, 1)
+	go func() {
+		_, out, _ := acpcRun("prompt", "next")
+		queuedOut <- out
+	}()
 	assert.Equal(t, cmd.Process.Pid, listSessions(t)[0].ClientPid)
 
 	mustAcp(t, "cancel")
@@ -272,8 +277,32 @@ func TestSessionCancelForegroundTurn(t *testing.T) {
 	require.ErrorAs(t, cmd.Wait(), &exit, stderr.String())
 	assert.Equal(t, 130, exit.ExitCode(), stderr.String())
 	assert.Contains(t, rest, "cancelled")
+	assert.Contains(t, <-queuedOut, "> next")
 
 	assert.Contains(t, mustAcp(t, "prompt", "after"), "> after")
+}
+
+// drained waits until the session in dir has no queued prompt, no client
+// and no running turn.
+func drained(t *testing.T, dir string) {
+	t.Helper()
+	spec, err := acphost.ReadSpec(dir)
+	require.NoError(t, err)
+	require.Eventually(t, func() bool {
+		if len(acpc.QueueAhead(dir, "")) > 0 {
+			return false
+		}
+		if _, held := acpc.LockHolder(dir); held {
+			return false
+		}
+		busy, err := acpc.HostBusy(dir, spec.MethodPrefix)
+		return err == nil && !busy
+	}, 10*time.Second, 20*time.Millisecond, "queue.log: %s", readFile(filepath.Join(dir, acpc.QueueLog)))
+}
+
+func readFile(path string) string {
+	b, _ := os.ReadFile(path)
+	return string(b)
 }
 
 // watched is command output that can be read while the command runs, and
@@ -307,19 +336,21 @@ func (w *watched) String() string {
 // and cancel stops one.
 func TestSessionDetachedTurn(t *testing.T) {
 	sessionEnv(t)
-	newSession(t, nil)
+	dir := newSession(t, nil)
 	gate := filepath.Join(shortDir(t), "gate")
 	require.NoError(t, unix.Mkfifo(gate, 0o600))
 	config := filepath.Join(shortDir(t), "c.yaml")
 	require.NoError(t, os.WriteFile(config, []byte("env: [FOO=bar]\n"), 0o600))
 
 	assert.Empty(t, mustAcp(t, "prompt", "--no-wait", "wait", gate))
-	code, _, errs := acpcRun("prompt", "second")
-	assert.Equal(t, 1, code)
-	assert.Contains(t, errs, "a turn is running")
-	code, _, errs = acpcRun("prompt", "-c", config, "second")
-	assert.Equal(t, 1, code)
-	assert.Contains(t, errs, "the config cannot change now")
+	// Prompts for a busy session wait in the queue, in order. The second
+	// changes the isolation, which waits for the running turn to end.
+	code, _, errs := acpcRun("prompt", "--no-wait", "second")
+	assert.Equal(t, 0, code, errs)
+	assert.Contains(t, errs, "queued")
+	code, _, errs = acpcRun("prompt", "--no-wait", "-c", config, "env", "FOO")
+	assert.Equal(t, 0, code, errs)
+	assert.Contains(t, errs, "queued")
 
 	out := &watched{marker: "waiting", seen: make(chan struct{})}
 	done := make(chan int)
@@ -339,6 +370,9 @@ func TestSessionDetachedTurn(t *testing.T) {
 	assert.Contains(t, out.String(), "=== turn ")
 	assert.Contains(t, out.String(), "released")
 	assert.Contains(t, out.String(), "end_turn")
+	drained(t, dir)
+	queued := mustAcp(t, "attach")
+	assert.Regexp(t, `(?s)> second\n.*FOO=bar\n`, queued, "the queued prompts ran in order, the second under its config\nfirst attach:\n%s\nqueue.log:\n%s\njournal:\n%s", out.String(), readFile(filepath.Join(dir, "queue.log")), readFile(filepath.Join(dir, "journal.ndjson")))
 	assert.Empty(t, mustAcp(t, "attach"), "nothing new since the last attach")
 
 	mustAcp(t, "prompt", "--no-wait", "hold")
@@ -446,4 +480,35 @@ func TestExec(t *testing.T) {
 			assert.Empty(t, left, "the temporary session is removed")
 		})
 	}
+}
+
+// Files go with a prompt in the forms the agent takes: an image as an
+// image, a text file embedded, and with neither capability as a link.
+func TestPromptFiles(t *testing.T) {
+	dir := shortDir(t)
+	t.Chdir(dir)
+	tmp := shortDir(t)
+	t.Setenv("TMPDIR", tmp)
+	stopHosts(t, filepath.Join(tmp, "*"))
+	png := filepath.Join(dir, "a.png")
+	require.NoError(t, os.WriteFile(png, []byte("\x89PNG\r\n\x1a\nfake"), 0o600))
+	txt := filepath.Join(dir, "notes.txt")
+	require.NoError(t, os.WriteFile(txt, []byte("hello"), 0o600))
+
+	code, out, errs := acpIn("", append([]string{"exec", "--format", "quiet", "-f", png, "--file", txt, "blocks"}, fakeAgentCommand()...)...)
+	require.Equal(t, 0, code, errs)
+	assert.Contains(t, out, "block image image/png file://"+png+" 16\n") // base64 of 12 bytes
+	assert.Contains(t, out, "block resource text/plain file://"+txt+" 5\n")
+
+	code, out, errs = acpIn("", append([]string{"exec", "--format", "quiet", "-f", txt, "blocks"}, fakeAgentCommand(agentPlain)...)...)
+	require.Equal(t, 0, code, errs)
+	assert.Contains(t, out, "block resource_link text/plain file://"+txt)
+
+	code, _, errs = acpIn("", append([]string{"exec", "-f", png, "blocks"}, fakeAgentCommand(agentPlain)...)...)
+	assert.Equal(t, 1, code)
+	assert.Contains(t, errs, "does not accept images")
+
+	code, _, errs = acpIn("", append([]string{"exec", "-f", filepath.Join(dir, "missing"), "blocks"}, fakeAgentCommand()...)...)
+	assert.Equal(t, 2, code)
+	assert.Contains(t, errs, "--file")
 }

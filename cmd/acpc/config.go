@@ -8,33 +8,15 @@ import (
 	"os"
 	"strings"
 
-	"github.com/gfx-labs/acphost/pkg/acphost"
-	"github.com/gfx-labs/acphost/pkg/cgroup"
+	"github.com/gfx-labs/acpc/pkg/acpc"
+
 	"github.com/gfx-labs/acphost/pkg/sandbox"
-	"github.com/gfx-labs/acphost/pkg/userns"
 	"go.yaml.in/yaml/v3"
 )
 
-// Config is the -c file: the isolation sections of a jobshop agent or
-// pool, with the same keys as acphost's JSON (sandbox.Sandbox,
-// userns.User, cgroup.Cgroup). Unknown keys are an error.
-type Config struct {
-	Sandbox *sandbox.Sandbox `json:"sandbox,omitempty"`
-	User    *userns.User     `json:"user,omitempty"`
-	Cgroup  *cgroup.Cgroup   `json:"cgroup,omitempty"`
-	// Env is KEY=VALUE added to the command's environment.
-	Env []string `json:"env,omitempty"`
-	// Join maps a namespace type to a namespace file (Spec.Join).
-	Join map[string]string `json:"join,omitempty"`
-	// Listen and TLS are Spec.Listen and Spec.TLS: the optional TCP
-	// listener of a host.
-	Listen string             `json:"listen,omitempty"`
-	TLS    *acphost.ListenTLS `json:"tls,omitempty"`
-}
-
 // readConfig reads path ("-" is stdin, "" is an empty config).
-func readConfig(path string, stdin io.Reader) (Config, error) {
-	var c Config
+func readConfig(path string, stdin io.Reader) (acpc.Config, error) {
+	var c acpc.Config
 	if path == "" {
 		return c, nil
 	}
@@ -57,7 +39,7 @@ func readConfig(path string, stdin io.Reader) (Config, error) {
 // parseConfig decodes YAML (or JSON, which is YAML) into c. It goes
 // through JSON so the json tags and Mount's string-or-object form apply,
 // and rejects unknown keys.
-func parseConfig(b []byte, c *Config) error {
+func parseConfig(b []byte, c *acpc.Config) error {
 	var v any
 	if err := yaml.Unmarshal(b, &v); err != nil {
 		return err

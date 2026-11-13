@@ -24,11 +24,12 @@ import (
 	"strings"
 	"time"
 
+	"github.com/gfx-labs/acpc/pkg/acpc"
+
 	"github.com/gfx-labs/acphost/pkg/acphost"
 	"github.com/gfx-labs/acphost/pkg/proc"
 	"github.com/gfx-labs/acphost/pkg/sandbox"
 	"github.com/urfave/cli/v3"
-	"golang.org/x/sys/unix"
 )
 
 func main() {
@@ -59,7 +60,7 @@ func isolationFrom(cmd *cli.Command) isolation {
 }
 
 // load reads the config file and applies the flag overrides.
-func (i isolation) load(stdin io.Reader) (Config, error) {
+func (i isolation) load(stdin io.Reader) (acpc.Config, error) {
 	c, err := readConfig(i.config, stdin)
 	if err != nil {
 		return c, err
@@ -96,11 +97,11 @@ func (a *app) cmdDetached(_ context.Context, cmd *cli.Command) error {
 	if cmd.NArg() > 0 || a.dashed {
 		return fmt.Errorf("%s takes no arguments", cmd.Name)
 	}
-	t, err := resolve(cmd.String("session"), cmd.String("dir"), defaultSession)
+	t, err := acpc.Resolve(cmd.String("session"), cmd.String("dir"), acpc.DefaultSession)
 	if err != nil {
 		return err
 	}
-	d, err := proc.Open(t.dir)
+	d, err := proc.Open(t.Dir)
 	if err != nil {
 		return a.fail(1, err)
 	}
@@ -137,7 +138,7 @@ func status(d *proc.Detached, stdout io.Writer) int {
 }
 
 func stop(d *proc.Detached, grace time.Duration, stdout, stderr io.Writer) int {
-	ex, err := stopWait(d, grace)
+	ex, err := acpc.StopWait(d, grace)
 	if errors.Is(err, context.DeadlineExceeded) {
 		say(stderr, "acpc: killed host", d.Pid)
 		return 1
@@ -148,25 +149,6 @@ func stop(d *proc.Detached, grace time.Duration, stdout, stderr io.Writer) int {
 	}
 	writeJSON(stdout, ex)
 	return 0
-}
-
-// stopWait stops d and waits for its exit. With a grace it SIGKILLs a host
-// that has not finished by then and returns context.DeadlineExceeded.
-func stopWait(d *proc.Detached, grace time.Duration) (proc.Exit, error) {
-	if err := d.Stop(); err != nil {
-		return proc.Exit{}, err
-	}
-	ctx := context.Background()
-	if grace > 0 {
-		var cancel context.CancelFunc
-		ctx, cancel = context.WithTimeout(ctx, grace)
-		defer cancel()
-	}
-	ex, err := d.Wait(ctx)
-	if errors.Is(err, context.DeadlineExceeded) {
-		_ = unix.Kill(d.Pid, unix.SIGKILL)
-	}
-	return ex, err
 }
 
 // exitCode maps an Exit to a status: 125 for a setup failure, 128+n for a

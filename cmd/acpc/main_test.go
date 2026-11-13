@@ -6,6 +6,8 @@ import (
 	"path/filepath"
 	"testing"
 
+	"github.com/gfx-labs/acpc/pkg/acpc"
+
 	"github.com/gfx-labs/acphost/pkg/acphost"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -14,11 +16,15 @@ import (
 func TestMain(m *testing.M) {
 	acphost.MaybeChild()
 	maybeFakeAgent()
+	// A queued --no-wait prompt is sent by this binary re-exec'd as acpc.
+	if len(os.Args) > 1 && os.Args[1] == "prompt" {
+		os.Exit(run(os.Args[1:], os.Stdin, os.Stdout, os.Stderr))
+	}
 	os.Exit(m.Run())
 }
 
 func TestParseConfig(t *testing.T) {
-	var c Config
+	var c acpc.Config
 	require.NoError(t, parseConfig([]byte(`
 sandbox:
   ro: [/nix, {src: /etc, dst: /host-etc}]
@@ -36,7 +42,7 @@ env: [A=b]
 	assert.Equal(t, int64(64), c.Cgroup.PidsMax)
 
 	for _, bad := range []string{"sandbox: {networ: none}", "nope: 1", "user: {uid: 1, extra: 2}"} {
-		var c Config
+		var c acpc.Config
 		assert.Error(t, parseConfig([]byte(bad), &c), bad)
 	}
 }

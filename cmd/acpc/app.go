@@ -10,6 +10,8 @@ import (
 	"strconv"
 	"time"
 
+	"github.com/gfx-labs/acpc/pkg/acpc"
+
 	"github.com/urfave/cli/v3"
 )
 
@@ -113,16 +115,17 @@ func newApp(stdin io.Reader, stdout, stderr io.Writer) *app {
 			}),
 		},
 		{
-			Name: "prompt", Usage: "send a prompt to a session and show the turn",
+			Name: "prompt", Usage: "send a prompt to a session and show the turn; queued if the session is busy",
 			ArgsUsage: "TEXT... (no TEXT, or -, reads stdin)", Action: a.cmdPrompt,
-			Flags: join(sessionFlags(), turnFlags(), isolationFlags(), []cli.Flag{
-				&cli.BoolFlag{Name: "no-wait", Usage: "return once the host has the prompt; attach shows the turn"},
+			Flags: join(sessionFlags(), turnFlags(), fileFlags(), isolationFlags(), []cli.Flag{
+				&cli.BoolFlag{Name: "no-wait", Usage: "return once the host has the prompt, or once it is queued behind a running turn; attach shows the turn"},
+				&cli.StringFlag{Name: "queued", Hidden: true, Usage: "internal: wait for and send this queued prompt"},
 			}),
 		},
 		{
 			Name: "exec", Usage: "one prompt in a temporary session that is removed afterwards",
 			ArgsUsage: "TEXT... -- CMD ARGS... (no TEXT, or -, reads stdin)", Action: a.cmdExec,
-			Flags: join(turnFlags(), isolationFlags()),
+			Flags: join(turnFlags(), fileFlags(), isolationFlags()),
 		},
 		{
 			Name: "attach", Usage: "show what a session did since this client last looked, and the running turn",
@@ -130,7 +133,10 @@ func newApp(stdin io.Reader, stdout, stderr io.Writer) *app {
 		},
 		{
 			Name: "cancel", Usage: "cancel a session's running turn",
-			Flags: sessionFlags(), Action: a.cmdCancel,
+			Action: a.cmdCancel,
+			Flags: join(sessionFlags(), []cli.Flag{
+				&cli.BoolFlag{Name: "queued", Usage: "also drop the prompts waiting in the queue"},
+			}),
 		},
 		{
 			Name: "ls", Usage: "list the sessions of the working directory",
@@ -206,7 +212,7 @@ func sessionFlags() []cli.Flag {
 
 // graceFlag is stop's --grace.
 func graceFlag() cli.Flag {
-	return &cli.DurationFlag{Name: "grace", Value: stopGrace, Usage: "SIGKILL the host if it still runs after this long (0 waits)"}
+	return &cli.DurationFlag{Name: "grace", Value: acpc.StopGrace, Usage: "SIGKILL the host if it still runs after this long (0 waits)"}
 }
 
 // turnFlags are how a turn is shown and how permission requests are answered.
@@ -216,6 +222,13 @@ func turnFlags() []cli.Flag {
 		&cli.BoolFlag{Name: "approve-all", Usage: "allow every permission request"},
 		&cli.BoolFlag{Name: "approve-reads", Usage: "allow read and search requests, refuse the rest (default)"},
 		&cli.BoolFlag{Name: "deny-all", Usage: "refuse every permission request"},
+	}
+}
+
+// fileFlags are the files sent with a prompt.
+func fileFlags() []cli.Flag {
+	return []cli.Flag{
+		&cli.StringSliceFlag{Name: "file", Aliases: []string{"f"}, Usage: "send `PATH` with the prompt: an image as an image, another file embedded or linked (repeatable)"},
 	}
 }
 
