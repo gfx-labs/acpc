@@ -49,6 +49,8 @@ type clientState struct {
 	HostPid int `json:"host_pid"`
 	// Seq is the last journal frame shown to the user.
 	Seq int64 `json:"seq"`
+	// Protocol is the ACP version the session was created with. Zero is 1.
+	Protocol int `json:"protocol,omitempty"`
 }
 
 func readState(dir string) (clientState, error) {
@@ -243,6 +245,10 @@ type Options struct {
 	Trace io.Writer
 	// ClientInfo is sent in initialize.
 	ClientInfo acp.Implementation
+	// Protocol is the ACP version for a session this client creates:
+	// ProtocolV1 (zero) or the experimental ProtocolV2. An existing
+	// session keeps the version it was created with.
+	Protocol int
 }
 
 // Session is one client's use of a session directory. It holds the

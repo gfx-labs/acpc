@@ -3,8 +3,8 @@ module github.com/gfx-labs/acpc
 go 1.27.3
 
 require (
-	github.com/gfx-labs/acphost v0.26.0
-	github.com/gfx-labs/go-acp v0.1.1
+	github.com/gfx-labs/acphost v0.29.0
+	github.com/gfx-labs/go-acp v0.2.0
 	github.com/stretchr/testify v1.12.1
 	github.com/urfave/cli/v3 v3.14.0
 	go.yaml.in/yaml/v3 v3.0.5

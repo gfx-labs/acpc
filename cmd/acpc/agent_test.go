@@ -25,6 +25,7 @@ const (
 	agentLoadFails = "loadfail" // session/load is offered and fails
 	agentQuits     = "quit"     // exits 3 on initialize
 	agentPlain     = "plain"    // no image or embeddedContext prompt capability
+	agentV2        = "v2"       // speaks the ACP v2 draft when the client asks for it
 )
 
 // fakeAgentCommand is the agent command line for a test, with the "--".
@@ -36,6 +37,7 @@ type fakeAgent struct {
 	mode    string
 	mu      sync.Mutex // serializes writes to stdout
 	session string
+	v2      bool          // the client asked for protocol version 2 and this is a v2 agent
 	cancel  chan struct{} // a session/cancel arrived
 	answers chan message  // responses to this agent's requests
 }
@@ -165,6 +167,16 @@ func (a *fakeAgent) handle(m message) {
 		if a.mode == agentQuits {
 			os.Exit(3)
 		}
+		var req struct {
+			ProtocolVersion int `json:"protocolVersion"`
+		}
+		_ = json.Unmarshal(m.Params, &req)
+		if a.mode == agentV2 && req.ProtocolVersion == 2 {
+			// v2: role-agnostic info and capabilities; resume is baseline.
+			a.v2 = true
+			a.send(message{ID: m.ID, Result: json.RawMessage(`{"protocolVersion":2,"info":{"name":"fake","version":"0"},"capabilities":{"session":{"prompt":{}}}}`)})
+			return
+		}
 		res := initializeResult{ProtocolVersion: 1}
 		res.AgentCapabilities.LoadSession = a.mode == agentLoads || a.mode == agentLoadFails
 		// The default agent takes images and embedded files; "plain" only
@@ -175,6 +187,12 @@ func (a *fakeAgent) handle(m message) {
 	case "session/new":
 		a.session = fmt.Sprintf("sess-%d", os.Getpid())
 		a.send(message{ID: m.ID, Result: rawJSON(sessionResult{SessionID: a.session})})
+	case "session/resume":
+		var p sessionParams
+		_ = json.Unmarshal(m.Params, &p)
+		a.session = p.SessionID
+		a.state("idle", "")
+		a.send(message{ID: m.ID, Result: rawJSON(struct{}{})})
 	case "session/load":
 		if a.mode == agentLoadFails {
 			a.send(message{ID: m.ID, Error: &rpcError{Code: -32002, Message: "session not found"}})
@@ -197,6 +215,12 @@ func (a *fakeAgent) handle(m message) {
 }
 
 func (a *fakeAgent) turn(m message) {
+	if a.v2 {
+		// v2: acknowledge the prompt, run it, report its end as idle.
+		a.send(message{ID: m.ID, Result: json.RawMessage(`{"messageId":"m1"}`)})
+		a.state("running", "")
+		m.ID = nil
+	}
 	var p promptParams
 	_ = json.Unmarshal(m.Params, &p)
 	var text string
@@ -260,7 +284,20 @@ func (a *fakeAgent) turn(m message) {
 	default:
 		a.say(a.session + "> " + text + "\n")
 	}
+	if a.v2 {
+		a.state("idle", stop)
+		return
+	}
 	a.send(message{ID: m.ID, Result: rawJSON(promptResult{StopReason: stop})})
+}
+
+// state sends a v2 state_update; stop is left out when empty.
+func (a *fakeAgent) state(state, stop string) {
+	u := map[string]string{"sessionUpdate": "state_update", "state": state}
+	if stop != "" {
+		u["stopReason"] = stop
+	}
+	a.send(message{Method: "session/update", Params: rawJSON(map[string]any{"sessionId": a.session, "update": u})})
 }
 
 // ask requests permission for a tool call of the given kind and returns

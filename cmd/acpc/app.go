@@ -25,6 +25,9 @@ type app struct {
 	stdin          io.Reader
 	stdout, stderr io.Writer
 	root           *cli.Command
+	// protocol is the hidden --protocol of new and exec: the ACP version
+	// of a session they create. 0 is version 1.
+	protocol int
 	// rest is everything after the first "--" and dashed whether there
 	// was one. run splits it off before urfave/cli parses, because
 	// urfave/cli drops the "--" and the commands need to know where it was.
@@ -112,6 +115,7 @@ func newApp(stdin io.Reader, stdout, stderr io.Writer) *app {
 			ArgsUsage: "-- CMD ARGS...", Action: a.cmdNew, StopOnNthArg: new(1),
 			Flags: join(sessionFlags(), isolationFlags(), []cli.Flag{
 				&cli.DurationFlag{Name: "lease", Value: sessionLease, Usage: "the host exits after no client for this long; the next prompt restarts it"},
+				protocolFlag(),
 			}),
 		},
 		{
@@ -125,7 +129,7 @@ func newApp(stdin io.Reader, stdout, stderr io.Writer) *app {
 		{
 			Name: "exec", Usage: "one prompt in a temporary session that is removed afterwards",
 			ArgsUsage: "TEXT... -- CMD ARGS... (no TEXT, or -, reads stdin)", Action: a.cmdExec,
-			Flags: join(turnFlags(), fileFlags(), isolationFlags()),
+			Flags: join(turnFlags(), fileFlags(), isolationFlags(), []cli.Flag{protocolFlag()}),
 		},
 		{
 			Name: "attach", Usage: "show what a session did since this client last looked, and the running turn",
@@ -222,6 +226,21 @@ func turnFlags() []cli.Flag {
 		&cli.BoolFlag{Name: "approve-all", Usage: "allow every permission request"},
 		&cli.BoolFlag{Name: "approve-reads", Usage: "allow read and search requests, refuse the rest (default)"},
 		&cli.BoolFlag{Name: "deny-all", Usage: "refuse every permission request"},
+	}
+}
+
+// protocolFlag selects the ACP version of a new session. Hidden: version 2
+// is an upstream draft, experimental and never the default.
+func protocolFlag() cli.Flag {
+	return &cli.IntFlag{
+		Name: "protocol", Value: 1, Hidden: true,
+		Usage: "experimental: ACP protocol `VERSION` (1, or 2 for the v2 draft)",
+		Validator: func(v int) error {
+			if v != 1 && v != 2 {
+				return fmt.Errorf("--protocol %d: want 1 or 2", v)
+			}
+			return nil
+		},
 	}
 }
 

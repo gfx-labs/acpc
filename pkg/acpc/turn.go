@@ -18,6 +18,9 @@ func (s *Session) Create() error {
 	if err := acphost.WriteSpec(s.t.Dir, s.spec); err != nil {
 		return err
 	}
+	if s.opts.Protocol == ProtocolV2 {
+		s.state.Protocol = ProtocolV2
+	}
 	if err := s.Start(); err != nil {
 		return err
 	}
@@ -32,17 +35,23 @@ func (s *Session) Create() error {
 // Prompt sends one prompt and returns once the turn ended. A signal
 // cancels the turn; a second one returns ErrInterrupted.
 func (s *Session) Prompt(in PromptInput) (acp.StopReason, error) {
-	req, err := s.ready(in)
+	blocks, err := s.ready(in)
 	if err != nil {
 		return "", err
 	}
 	s.inTurn = true
-	var res acp.PromptResponse
+	var stop acp.StopReason
+	done := false
 	err = s.wait(func(ctx context.Context) error {
 		var err error
-		res, err = s.link.conn.Prompt(ctx, req)
+		stop, done, err = s.link.proto.prompt(ctx, s.state.ACPSession, blocks)
 		return err
 	}, nil)
+	if err == nil && !done {
+		// v2: the result only acknowledged the prompt; the host reports
+		// the idle state_update that ends the turn as turn_end.
+		stop, err = s.AwaitTurn()
+	}
 	s.inTurn = false
 	if err != nil && !errors.Is(err, ErrInterrupted) {
 		var gone *HostGoneError
@@ -50,21 +59,21 @@ func (s *Session) Prompt(in PromptInput) (acp.StopReason, error) {
 			err = fmt.Errorf("session/prompt: %w", err)
 		}
 	}
-	return res.StopReason, err
+	return stop, err
 }
 
 // ready prepares the agent for a prompt and returns the request to send.
-func (s *Session) ready(in PromptInput) (acp.PromptRequest, error) {
+func (s *Session) ready(in PromptInput) ([]acp.ContentBlock, error) {
 	seed, err := s.ensure()
 	if err != nil {
-		return acp.PromptRequest{}, err
+		return nil, err
 	}
 	if seed != "" {
 		// Summarize drops everything up to SummaryEnd, so a later
 		// summary does not nest this one.
 		in.Text = seed + "\n\n" + acphost.SummaryEnd + "\n\n" + in.Text
 	}
-	return s.promptRequest(in)
+	return s.promptBlocks(in)
 }
 
 // Submit sends one prompt and returns once the host has journaled it. A
@@ -74,7 +83,7 @@ func (s *Session) ready(in PromptInput) (acp.PromptRequest, error) {
 // when it does. Closing the connection ends the call instead, and the turn
 // keeps running.
 func (s *Session) Submit(in PromptInput) error {
-	req, err := s.ready(in)
+	blocks, err := s.ready(in)
 	if err != nil {
 		return err
 	}
@@ -84,7 +93,7 @@ func (s *Session) Submit(in PromptInput) error {
 	if fi, err := os.Stat(s.journal()); err == nil && fi.Size() > from {
 		from = fi.Size()
 	}
-	go func() { _, _ = s.link.conn.Prompt(context.Background(), req) }()
+	go func() { _, _, _ = s.link.proto.prompt(context.Background(), s.state.ACPSession, blocks) }()
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	go func() {

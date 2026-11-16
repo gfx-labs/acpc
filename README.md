@@ -59,6 +59,9 @@ acpc rm -s work
 - If the host stopped, the next `prompt` starts it and the agent loads
   the conversation (`session/load`), or gets a summary of the journal if
   it cannot.
+- `new --protocol 2` and `exec --protocol 2` (hidden, experimental) speak
+  the ACP v2 draft instead of version 1. See
+  `docs/notes/2026-11-16-acp-v2.md`.
 - A prompt for a session in use waits its turn: prompts run one after
   another in the order they came. With `--no-wait` a detached acpc waits
   for it, logging to `queue.log` in the session directory.

@@ -8,8 +8,6 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
-	"encoding/json/jsontext"
-	jsonv2 "encoding/json/v2"
 	"errors"
 	"fmt"
 	"net"
@@ -41,8 +39,8 @@ const (
 
 // link is a connection to a session's host.
 type link struct {
-	nc   net.Conn
-	conn *acp.ClientSideConnection
+	nc    net.Conn
+	proto protocol
 	// activity has a value when the host sent something since the last
 	// look, so the journal has grown.
 	activity chan struct{}
@@ -63,25 +61,37 @@ func (s *Session) dial() (*link, acphost.Welcome, error) {
 		nc: nc, activity: make(chan struct{}, 1),
 		turnEnd: make(chan acphost.TurnEnd, 1), served: make(chan struct{}),
 	}
-	l.conn = acp.NewClientSideConnection(&agentRequests{s: s, l: l}, nc, rd, nil)
+	r := &agentRequests{s: s, l: l}
+	if s.protocol(w) == ProtocolV2 {
+		l.proto = newV2(r, nc, rd)
+	} else {
+		l.proto = newV1(r, nc, rd)
+	}
 	end := acphost.MethodName(w.MethodPrefix, "turn_end")
-	if err := l.conn.RegisterExtensionNotification(end, func(_ context.Context, _ string, params jsontext.Value) (any, *acp.RequestError) {
+	if err := l.proto.onExtNotification(end, func(params []byte) {
 		var te acphost.TurnEnd
 		_ = json.Unmarshal(params, &te)
 		select {
 		case l.turnEnd <- te:
 		default:
 		}
-		return nil, nil
 	}); err != nil {
 		_ = nc.Close()
 		return nil, w, err
 	}
 	go func() {
 		defer close(l.served)
-		_ = l.conn.Serve(context.Background())
+		_ = l.proto.serve(context.Background())
 	}()
 	return l, w, nil
+}
+
+// reopenMethod names the method that opens a session in a new agent.
+func (l *link) reopenMethod() string {
+	if _, ok := l.proto.(*v2); ok {
+		return "session/resume"
+	}
+	return "session/load"
 }
 
 // grew notes that the journal has grown.
@@ -112,7 +122,23 @@ func (r *agentRequests) SessionUpdate(context.Context, acp.SessionNotification) 
 
 func (r *agentRequests) RequestPermission(_ context.Context, p acp.RequestPermissionRequest) (acp.RequestPermissionResponse, error) {
 	r.l.grew()
-	return acp.RequestPermissionResponse{Outcome: r.s.permit(p)}, nil
+	ask := permissionAsk{options: make([]permissionChoice, 0, len(p.Options))}
+	if p.ToolCall.Kind != nil {
+		ask.kind = string(*p.ToolCall.Kind)
+	}
+	if p.ToolCall.Title != nil {
+		ask.title = *p.ToolCall.Title
+	}
+	if ask.title == "" {
+		ask.title = "tool call " + string(p.ToolCall.ToolCallId)
+	}
+	for _, o := range p.Options {
+		ask.options = append(ask.options, permissionChoice{id: string(o.OptionId), kind: string(o.Kind)})
+	}
+	if id, ok := r.s.decide(ask); ok {
+		return acp.RequestPermissionResponse{Outcome: acp.NewRequestPermissionOutcomeSelected(acp.PermissionOptionId(id))}, nil
+	}
+	return acp.RequestPermissionResponse{Outcome: acp.NewRequestPermissionOutcomeCancelled()}, nil
 }
 
 func (r *agentRequests) CompleteElicitation(context.Context, acp.CompleteElicitationNotification) error {
@@ -215,7 +241,7 @@ func (s *Session) wait(fn func(context.Context) error, done <-chan struct{}) err
 		case err := <-result:
 			// The host journals a frame before it sends it.
 			s.show()
-			if errors.Is(err, acp.ErrClosed) {
+			if isClosed(err) {
 				return s.lost()
 			}
 			return err
@@ -280,42 +306,35 @@ func (s *Session) interrupt() error {
 func (s *Session) CancelTurn() error {
 	// From here on a permission request is answered as cancelled, as ACP asks.
 	s.cancelling.Store(true)
-	return s.link.conn.Cancel(context.Background(), acp.CancelNotification{SessionId: acp.SessionId(s.state.ACPSession)})
+	return s.link.proto.cancel(context.Background(), s.state.ACPSession)
 }
 
-// permit picks the option the policy allows: an allow or a reject option,
-// the one-time kind first so nothing outlasts the request.
-func (s *Session) permit(p acp.RequestPermissionRequest) acp.RequestPermissionOutcome {
+// decide picks the option the policy allows: an allow or a reject option,
+// the one-time kind first so nothing outlasts the request. No option means
+// the request is answered as cancelled.
+func (s *Session) decide(p permissionAsk) (string, bool) {
 	if s.cancelling.Load() {
-		return acp.NewRequestPermissionOutcomeCancelled()
+		return "", false
 	}
-	var kind acp.ToolKind
-	if p.ToolCall.Kind != nil {
-		kind = *p.ToolCall.Kind
-	}
-	allow := s.opts.Policy == ApproveAll || (s.opts.Policy == ApproveReads && (kind == acp.ToolKindRead || kind == acp.ToolKindSearch))
+	allow := s.opts.Policy == ApproveAll || (s.opts.Policy == ApproveReads && (p.kind == string(acp.ToolKindRead) || p.kind == string(acp.ToolKindSearch)))
 	want := []acp.PermissionOptionKind{acp.PermissionOptionKindRejectOnce, acp.PermissionOptionKindRejectAlways}
 	if allow {
 		want = []acp.PermissionOptionKind{acp.PermissionOptionKindAllowOnce, acp.PermissionOptionKindAllowAlways}
 	} else {
-		what := "tool call " + string(p.ToolCall.ToolCallId)
-		if p.ToolCall.Title != nil && *p.ToolCall.Title != "" {
-			what = *p.ToolCall.Title
-		}
-		shown := string(kind)
+		shown := p.kind
 		if shown == "" {
 			shown = "kind not given"
 		}
-		s.logf("refused permission: %s (%s)\n", what, shown)
+		s.logf("refused permission: %s (%s)\n", p.title, shown)
 	}
 	for _, k := range want {
-		for _, o := range p.Options {
-			if o.Kind == k {
-				return acp.NewRequestPermissionOutcomeSelected(o.OptionId)
+		for _, o := range p.options {
+			if o.kind == string(k) {
+				return o.id, true
 			}
 		}
 	}
-	return acp.NewRequestPermissionOutcomeCancelled()
+	return "", false
 }
 
 // ensure makes the agent ready for a prompt: initialized, and with the ACP
@@ -331,60 +350,44 @@ func (s *Session) ensure() (seed string, err error) {
 		s.show()
 		s.muted = false
 	}()
-	var init acp.InitializeResponse
-	if len(s.welcome.Initialize) > 0 {
-		// The host replays the answer of the agent's one initialize.
-		if err := jsonv2.Unmarshal(s.welcome.Initialize, &init); err != nil {
-			return "", fmt.Errorf("initialize result from the host: %w", err)
-		}
-	} else {
+	if len(s.welcome.Initialize) == 0 {
 		s.tracef("[client] initialize (running)")
-		err := s.wait(func(ctx context.Context) error {
-			var err error
-			init, err = s.link.conn.Initialize(ctx, acp.InitializeRequest{
-				ProtocolVersion: acp.ProtocolVersion(acp.ProtocolVersionNumber),
-				ClientInfo:      &s.opts.ClientInfo,
-			})
-			return err
-		}, nil)
-		if err != nil {
-			return "", fmt.Errorf("initialize: %w", err)
-		}
+	}
+	var init agentInit
+	err = s.wait(func(ctx context.Context) error {
+		var err error
+		init, err = s.link.proto.initialize(ctx, s.welcome.Initialize, s.opts.ClientInfo)
+		return err
+	}, nil)
+	if err != nil {
+		return "", fmt.Errorf("initialize: %w", err)
+	}
+	if len(s.welcome.Initialize) == 0 {
 		// The host only caches it for the next connection; this one asks
 		// ensure again before the prompt.
-		if b, err := jsonv2.Marshal(init); err == nil {
-			s.welcome.Initialize = b
-		}
-		agent := acp.Implementation{}
-		if init.AgentInfo != nil {
-			agent = *init.AgentInfo
-		}
+		s.welcome.Initialize = init.raw
 		s.tracef("[client] initialized protocol version %d, agent %s %s, loadSession %t",
-			init.ProtocolVersion, agent.Name, agent.Version, init.AgentCapabilities.LoadSession)
+			init.version, init.name, init.agentVersion, init.reopen)
 	}
-	s.caps = init.AgentCapabilities.PromptCapabilities
+	s.caps = acp.PromptCapabilities{Image: init.image, EmbeddedContext: init.embeddedContext}
 	switch {
 	case s.state.ACPSession == "":
 		return "", s.newSession()
 	case s.state.HostPid == s.welcome.Pid:
 		return "", nil
 	}
-	if init.AgentCapabilities.LoadSession {
-		s.tracef("[client] session/load %s (running)", s.state.ACPSession)
+	if init.reopen {
+		s.tracef("[client] %s %s (running)", s.link.reopenMethod(), s.state.ACPSession)
 		err := s.wait(func(ctx context.Context) error {
-			_, err := s.link.conn.LoadSession(ctx, acp.LoadSessionRequest{
-				SessionId: acp.SessionId(s.state.ACPSession), Cwd: s.spec.Dir, McpServers: []acp.McpServer{},
-			})
-			return err
+			return s.link.proto.reopen(ctx, s.state.ACPSession, s.spec.Dir)
 		}, nil)
 		if err == nil {
 			return "", s.opened(s.state.ACPSession)
 		}
-		var refused *acp.RequestError
-		if !errors.As(err, &refused) {
+		if !requestError(err) {
 			return "", err
 		}
-		s.logln("session/load:", err)
+		s.logln(s.link.reopenMethod()+":", err)
 	}
 	// As jobshop does: a failed load would fail again on every restart.
 	frames, _, _ := acphost.ReadJournal(s.journal(), 0)
@@ -395,20 +398,20 @@ func (s *Session) ensure() (seed string, err error) {
 
 func (s *Session) newSession() error {
 	s.tracef("[client] session/new cwd %s (running)", s.spec.Dir)
-	var res acp.NewSessionResponse
+	var id string
 	err := s.wait(func(ctx context.Context) error {
 		var err error
-		res, err = s.link.conn.NewSession(ctx, acp.NewSessionRequest{Cwd: s.spec.Dir, McpServers: []acp.McpServer{}})
+		id, err = s.link.proto.newSession(ctx, s.spec.Dir)
 		return err
 	}, nil)
 	if err != nil {
 		return fmt.Errorf("session/new: %w", err)
 	}
-	if res.SessionId == "" {
+	if id == "" {
 		return errors.New("session/new: no sessionId in the result")
 	}
-	s.tracef("[client] session %s", res.SessionId)
-	return s.opened(string(res.SessionId))
+	s.tracef("[client] session %s", id)
+	return s.opened(id)
 }
 
 // opened records that the agent process behind this host has the ACP
@@ -418,13 +421,9 @@ func (s *Session) opened(id string) error {
 	return writeState(s.t.Dir, s.state)
 }
 
-// promptRequest is the session/prompt for in.
-func (s *Session) promptRequest(in PromptInput) (acp.PromptRequest, error) {
-	blocks, err := ContentBlocks(in, s.caps)
-	if err != nil {
-		return acp.PromptRequest{}, err
-	}
-	return acp.PromptRequest{SessionId: acp.SessionId(s.state.ACPSession), Prompt: blocks}, nil
+// promptBlocks is the session/prompt content for in.
+func (s *Session) promptBlocks(in PromptInput) ([]acp.ContentBlock, error) {
+	return ContentBlocks(in, s.caps)
 }
 
 // AwaitTurn waits for a turn another connection started. The host reports

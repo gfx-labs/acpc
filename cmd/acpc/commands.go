@@ -152,7 +152,7 @@ func hostName(t acpc.Target) string {
 
 // options are the acpc.Options for a command's session.
 func (a *app) options(out *output, policy string) acpc.Options {
-	o := acpc.Options{Policy: policy, Log: prefixed{a.stderr}, ClientInfo: acp.Implementation{Name: "acpc", Version: version()}}
+	o := acpc.Options{Policy: policy, Log: prefixed{a.stderr}, ClientInfo: acp.Implementation{Name: "acpc", Version: version()}, Protocol: a.protocol}
 	if out != nil {
 		o.Output = out
 	}
@@ -221,6 +221,7 @@ func (a *app) turn(s *acpc.Session, dir string, out *output, in acpc.PromptInput
 }
 
 func (a *app) cmdNew(_ context.Context, cmd *cli.Command) error {
+	a.protocol = cmd.Int("protocol")
 	argv := a.argv(cmd)
 	if len(argv) == 0 {
 		return errors.New("new: no agent command (give it after --)")
@@ -389,6 +390,7 @@ func (a *app) runWaiter(t acpc.Target, path string) int {
 }
 
 func (a *app) cmdExec(_ context.Context, cmd *cli.Command) error {
+	a.protocol = cmd.Int("protocol")
 	if len(a.rest) == 0 {
 		return errors.New("exec: no agent command (give it after --)")
 	}
