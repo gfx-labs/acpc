@@ -122,18 +122,18 @@ func (r *agentRequests) SessionUpdate(context.Context, acp.SessionNotification) 
 
 func (r *agentRequests) RequestPermission(_ context.Context, p acp.RequestPermissionRequest) (acp.RequestPermissionResponse, error) {
 	r.l.grew()
-	ask := permissionAsk{options: make([]permissionChoice, 0, len(p.Options))}
+	ask := Permission{Options: make([]PermissionOption, 0, len(p.Options))}
 	if p.ToolCall.Kind != nil {
-		ask.kind = string(*p.ToolCall.Kind)
+		ask.Kind = string(*p.ToolCall.Kind)
 	}
 	if p.ToolCall.Title != nil {
-		ask.title = *p.ToolCall.Title
+		ask.Title = *p.ToolCall.Title
 	}
-	if ask.title == "" {
-		ask.title = "tool call " + string(p.ToolCall.ToolCallId)
+	if ask.Title == "" {
+		ask.Title = "tool call " + string(p.ToolCall.ToolCallId)
 	}
 	for _, o := range p.Options {
-		ask.options = append(ask.options, permissionChoice{id: string(o.OptionId), kind: string(o.Kind)})
+		ask.Options = append(ask.Options, PermissionOption{ID: string(o.OptionId), Kind: string(o.Kind), Name: o.Name})
 	}
 	if id, ok := r.s.decide(ask); ok {
 		return acp.RequestPermissionResponse{Outcome: acp.NewRequestPermissionOutcomeSelected(acp.PermissionOptionId(id))}, nil
@@ -309,28 +309,32 @@ func (s *Session) CancelTurn() error {
 	return s.link.proto.cancel(context.Background(), s.state.ACPSession)
 }
 
-// decide picks the option the policy allows: an allow or a reject option,
-// the one-time kind first so nothing outlasts the request. No option means
-// the request is answered as cancelled.
-func (s *Session) decide(p permissionAsk) (string, bool) {
+// decide answers a permission request with Options.Ask, or else picks the
+// option the policy allows: an allow or a reject option, the one-time kind
+// first so nothing outlasts the request. No option means the request is
+// answered as cancelled.
+func (s *Session) decide(p Permission) (string, bool) {
 	if s.cancelling.Load() {
 		return "", false
 	}
-	allow := s.opts.Policy == ApproveAll || (s.opts.Policy == ApproveReads && (p.kind == string(acp.ToolKindRead) || p.kind == string(acp.ToolKindSearch)))
+	if s.opts.Ask != nil {
+		return s.opts.Ask(p)
+	}
+	allow := s.opts.Policy == ApproveAll || (s.opts.Policy == ApproveReads && (p.Kind == string(acp.ToolKindRead) || p.Kind == string(acp.ToolKindSearch)))
 	want := []acp.PermissionOptionKind{acp.PermissionOptionKindRejectOnce, acp.PermissionOptionKindRejectAlways}
 	if allow {
 		want = []acp.PermissionOptionKind{acp.PermissionOptionKindAllowOnce, acp.PermissionOptionKindAllowAlways}
 	} else {
-		shown := p.kind
+		shown := p.Kind
 		if shown == "" {
 			shown = "kind not given"
 		}
-		s.logf("refused permission: %s (%s)\n", p.title, shown)
+		s.logf("refused permission: %s (%s)\n", p.Title, shown)
 	}
 	for _, k := range want {
-		for _, o := range p.options {
-			if o.kind == string(k) {
-				return o.id, true
+		for _, o := range p.Options {
+			if o.Kind == string(k) {
+				return o.ID, true
 			}
 		}
 	}

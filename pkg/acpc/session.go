@@ -238,6 +238,13 @@ type Options struct {
 	// Policy answers permission requests: ApproveAll, ApproveReads
 	// (the default) or DenyAll.
 	Policy string
+	// Ask, when set, answers permission requests instead of Policy: the
+	// chosen option's ID, or false to answer the request as cancelled. It
+	// runs while the agent waits for the answer.
+	Ask func(Permission) (string, bool)
+	// Interrupts, when set, replaces SIGINT and SIGTERM: each value acts
+	// as one of those signals would.
+	Interrupts <-chan os.Signal
 	// Log gets notices such as a refused permission. Nil discards them.
 	Log io.Writer
 	// Trace gets the steps of the ACP handshake as they happen. Nil
@@ -259,7 +266,8 @@ type Session struct {
 	spec   acphost.Spec
 	state  clientState
 	unlock func()
-	sigs   chan os.Signal
+	sigs   <-chan os.Signal
+	caught chan os.Signal // signal.Notify's channel, nil with Options.Interrupts
 
 	link    *link
 	welcome acphost.Welcome
@@ -301,21 +309,32 @@ func open(t Target, spec acphost.Spec, opts Options, lock func(<-chan os.Signal)
 	if opts.Log == nil {
 		opts.Log = io.Discard
 	}
-	// Before the lock: cancel signals whoever holds it.
-	sigs := make(chan os.Signal, 2)
-	signal.Notify(sigs, unix.SIGINT, unix.SIGTERM)
-	unlock, err := lock(sigs)
+	s := &Session{opts: opts, t: t, spec: spec, sigs: opts.Interrupts}
+	if s.sigs == nil {
+		// Before the lock: cancel signals whoever holds it.
+		s.caught = make(chan os.Signal, 2)
+		signal.Notify(s.caught, unix.SIGINT, unix.SIGTERM)
+		s.sigs = s.caught
+	}
+	var err error
+	s.unlock, err = lock(s.sigs)
 	if err != nil {
-		signal.Stop(sigs)
+		s.stopSignals()
 		return nil, err
 	}
-	state, err := readState(t.Dir)
+	s.state, err = readState(t.Dir)
 	if err != nil {
-		unlock()
-		signal.Stop(sigs)
+		s.unlock()
+		s.stopSignals()
 		return nil, err
 	}
-	return &Session{opts: opts, t: t, spec: spec, state: state, unlock: unlock, sigs: sigs}, nil
+	return s, nil
+}
+
+func (s *Session) stopSignals() {
+	if s.caught != nil {
+		signal.Stop(s.caught)
+	}
 }
 
 // Busy reports whether a turn was running when the session connected.
@@ -350,7 +369,7 @@ func (s *Session) Close() {
 		s.logln(err)
 	}
 	s.unlock()
-	signal.Stop(s.sigs)
+	s.stopSignals()
 }
 
 // Start starts the session's host if none runs. A host that cannot start

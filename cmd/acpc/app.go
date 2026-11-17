@@ -155,6 +155,20 @@ func newApp(stdin io.Reader, stdout, stderr io.Writer) *app {
 			Flags:  []cli.Flag{&cli.StringFlag{Name: "session", Aliases: []string{"s"}, Usage: "session `NAME`"}},
 			Action: a.cmdRm,
 		},
+		{
+			Name: "a2a", Usage: "serve the agent over A2A on loopback: a context is a session, a task is a turn",
+			ArgsUsage: "-- CMD ARGS...", Action: a.cmdA2A, StopOnNthArg: new(1),
+			Flags: join(isolationFlags(), []cli.Flag{
+				&cli.StringFlag{Name: "listen", Required: true, Usage: "listen on `ADDR`: a loopback host:port, or unix:PATH"},
+				&cli.StringFlag{Name: "cwd", Value: ".", Usage: "the agent's working `DIR` for every context"},
+				&cli.StringFlag{Name: "card", Usage: "agent card `FILE` (YAML or JSON): the public URL and security schemes of a proxy in front, name, skills"},
+				&cli.DurationFlag{Name: "lease", Value: sessionLease, Usage: "a context's host exits after no turn for this long; the next message restarts it"},
+				&cli.BoolFlag{Name: acpc.ApproveAll, Usage: "allow every permission request"},
+				&cli.BoolFlag{Name: acpc.ApproveReads, Usage: "allow read and search requests, refuse the rest (default)"},
+				&cli.BoolFlag{Name: acpc.DenyAll, Usage: "refuse every permission request"},
+				&cli.BoolFlag{Name: "ask", Usage: "put each permission request to the A2A client: the task waits at input-required for the option it replies with"},
+			}),
+		},
 	}
 	a.root = &cli.Command{
 		Name:    "acpc",

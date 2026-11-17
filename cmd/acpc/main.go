@@ -10,6 +10,7 @@
 //	acpc attach|cancel|rm -s NAME
 //	acpc status|stop|wait -s NAME
 //	acpc ls
+//	acpc a2a --listen 127.0.0.1:PORT [--cwd DIR] [--card FILE] [--ask] -- CMD ARGS...
 //
 // See docs/notes/290-cli-sessions.md.
 package main
@@ -65,6 +66,11 @@ func (i isolation) load(stdin io.Reader) (acpc.Config, error) {
 	if err != nil {
 		return c, err
 	}
+	return c, i.apply(&c)
+}
+
+// apply applies the flag overrides to c.
+func (i isolation) apply(c *acpc.Config) error {
 	if i.network != "" || len(i.ro) > 0 || len(i.rw) > 0 {
 		if c.Sandbox == nil {
 			c.Sandbox = &sandbox.Sandbox{}
@@ -82,14 +88,14 @@ func (i isolation) load(stdin io.Reader) (acpc.Config, error) {
 	for _, j := range i.join {
 		t, p, ok := strings.Cut(j, "=")
 		if !ok {
-			return c, fmt.Errorf("--join %q: want TYPE=PATH", j)
+			return fmt.Errorf("--join %q: want TYPE=PATH", j)
 		}
 		if c.Join == nil {
 			c.Join = map[string]string{}
 		}
 		c.Join[t] = p
 	}
-	return c, nil
+	return nil
 }
 
 // cmdDetached is status, stop and wait on a session's host.

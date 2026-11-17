@@ -50,13 +50,14 @@ type agentInit struct {
 	image, embeddedContext bool
 }
 
-// permissionAsk is a permission request in either version.
-type permissionAsk struct {
-	kind, title string
-	options     []permissionChoice
+// Permission is a permission request from the agent, in either version.
+type Permission struct {
+	Kind, Title string
+	Options     []PermissionOption
 }
 
-type permissionChoice struct{ id, kind string }
+// PermissionOption is one answer the agent offers for a Permission.
+type PermissionOption struct{ ID, Kind, Name string }
 
 // errNotV2 is an agent that answered a v2 initialize with another version.
 var errNotV2 = errors.New("the agent does not speak ACP protocol version 2 (experimental --protocol 2)")
@@ -204,12 +205,12 @@ func (q v2Requests) SessionUpdate(context.Context, acp2.UpdateSessionNotificatio
 
 func (q v2Requests) RequestPermission(_ context.Context, p acp2.RequestPermissionRequest) (acp2.RequestPermissionResponse, error) {
 	q.r.l.grew()
-	ask := permissionAsk{title: p.Title}
+	ask := Permission{Title: p.Title}
 	if p.Subject != nil && p.Subject.ToolCall != nil && p.Subject.ToolCall.ToolCall.Kind != nil {
-		ask.kind = string(*p.Subject.ToolCall.ToolCall.Kind)
+		ask.Kind = string(*p.Subject.ToolCall.ToolCall.Kind)
 	}
 	for _, o := range p.Options {
-		ask.options = append(ask.options, permissionChoice{id: string(o.OptionId), kind: string(o.Kind)})
+		ask.Options = append(ask.Options, PermissionOption{ID: string(o.OptionId), Kind: string(o.Kind), Name: o.Name})
 	}
 	var out acp2.RequestPermissionOutcome
 	if id, ok := q.r.s.decide(ask); ok {

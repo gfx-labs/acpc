@@ -73,6 +73,31 @@ acpc rm -s work
 - Exit status: 0 `end_turn`, 130 cancelled, 1 another stop reason or an
   error, 125 the agent could not start, 2 a bad command line.
 
+## A2A
+
+```sh
+acpc a2a --listen 127.0.0.1:8080 --cwd ~/work -c agent.yaml -- towa serve
+```
+
+serves the agent over [A2A](https://a2a-protocol.org) v1.0 (JSON-RPC,
+with streaming), with the agent card at `/.well-known/agent-card.json`.
+
+- An A2A context is an acpc session, so it has a host of its own, keeps
+  its conversation across tasks and restarts, and waits in the same queue
+  as `acpc prompt`. A task is one turn: the agent's text streams as an
+  artifact, each tool call's title as a working status, and the stop
+  reason ends the task. Canceling a task cancels the turn.
+- Every context runs in `--cwd` under the isolation of `-c` and the
+  isolation flags.
+- It listens only on loopback or `unix:PATH` and has no authentication.
+  Put a proxy in front for anything else. `--card FILE` (YAML or JSON) is
+  merged into the agent card: give the proxy's URL in
+  `supportedInterfaces` and its auth in `securitySchemes` and
+  `securityRequirements`.
+- `--ask` puts each permission request to the A2A client: the task stops
+  at `input-required` with the options, and a reply on that task naming
+  one answers it. The permission flags work as for `prompt`.
+
 Details: [docs/notes/290-cli-sessions.md](docs/notes/290-cli-sessions.md),
 [docs/notes/2026-11-13-prompt-queue.md](docs/notes/2026-11-13-prompt-queue.md).
 

@@ -89,6 +89,15 @@ func turnOptions(cmd *cli.Command, w io.Writer) (*output, string, error) {
 	if format != formatText && format != formatJSON && format != formatQuiet {
 		return nil, "", fmt.Errorf("--format %q: want text, json or quiet", format)
 	}
+	policy, err := policyFrom(cmd)
+	if err != nil {
+		return nil, "", err
+	}
+	return &output{w: w, format: format, text: acphost.Renderer{W: w}}, policy, nil
+}
+
+// policyFrom reads the permission flags.
+func policyFrom(cmd *cli.Command) (string, error) {
 	policy, n := acpc.ApproveReads, 0
 	for _, p := range []string{acpc.ApproveAll, acpc.ApproveReads, acpc.DenyAll} {
 		if cmd.Bool(p) {
@@ -97,9 +106,9 @@ func turnOptions(cmd *cli.Command, w io.Writer) (*output, string, error) {
 		}
 	}
 	if n > 1 {
-		return nil, "", errors.New("give one of --approve-all, --approve-reads and --deny-all")
+		return "", errors.New("give one of --approve-all, --approve-reads and --deny-all")
 	}
-	return &output{w: w, format: format, text: acphost.Renderer{W: w}}, policy, nil
+	return policy, nil
 }
 
 // promptText is the prompt: the arguments joined by spaces, or stdin when
@@ -133,12 +142,17 @@ func (a *app) sessionSpec(name string, iso isolation, lease time.Duration, argv 
 	if err != nil {
 		return acphost.Spec{}, err
 	}
+	return specFor(c, name, cwd, lease, argv), nil
+}
+
+// specFor is the spec of a host that runs argv in cwd under c.
+func specFor(c acpc.Config, name, cwd string, lease time.Duration, argv []string) acphost.Spec {
 	return acphost.Spec{
 		Protocol: acphost.Protocol, Session: name, Command: argv[0], Args: argv[1:],
 		Env: c.Env, Dir: cwd, LeaseMS: lease.Milliseconds(),
 		Sandbox: c.Sandbox, User: c.User, Cgroup: c.Cgroup, Join: c.Join,
 		Listen: c.Listen, TLS: c.TLS,
-	}, nil
+	}
 }
 
 // hostName is Spec.Session for t: one path element (a cgroup and a GC

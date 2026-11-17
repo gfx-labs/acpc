@@ -3,6 +3,7 @@ module github.com/gfx-labs/acpc
 go 1.27.3
 
 require (
+	github.com/a2aproject/a2a-go/v2 v2.8.0
 	github.com/gfx-labs/acphost v0.29.0
 	github.com/gfx-labs/go-acp v0.2.0
 	github.com/stretchr/testify v1.12.1
@@ -13,6 +14,9 @@ require (
 
 require (
 	github.com/godbus/dbus/v5 v5.2.4 // indirect
+	github.com/google/uuid v1.6.0 // indirect
 	github.com/klauspost/compress v1.20.3 // indirect
 	github.com/valyala/bytebufferpool v1.0.0 // indirect
+	golang.org/x/mod v0.41.0 // indirect
+	golang.org/x/sync v0.23.0 // indirect
 )
